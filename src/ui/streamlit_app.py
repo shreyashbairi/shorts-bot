@@ -20,7 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.core.config import (
     Config, Platform, CaptionStyle, WhisperModel,
-    PlatformPreset, PRESET_CONFIGS
+    PlatformPreset, PRESET_CONFIGS, get_preset_config,
+    get_default_gpu_enabled
 )
 from src.core.pipeline import Pipeline, PipelineStage
 from src.core.logger import get_logger
@@ -197,8 +198,8 @@ def render_sidebar():
             help="Leave empty for auto-detection"
         )
 
-    # Build config from settings
-    config = PRESET_CONFIGS[preset_map[preset]]
+    # Build config from settings (use get_preset_config for proper GPU detection)
+    config = get_preset_config(preset_map[preset])
     config.update_for_platform(platform_map[platform])
     config.highlight.target_clips = num_clips
     config.highlight.min_clip_duration = min_duration
@@ -215,6 +216,15 @@ def render_sidebar():
 
     st.session_state.config = config
     st.session_state.enable_captions = enable_captions
+
+    # Show GPU status in sidebar
+    gpu_available = get_default_gpu_enabled()
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### System Info")
+    if gpu_available:
+        st.sidebar.success("GPU: CUDA Available")
+    else:
+        st.sidebar.info("GPU: Using CPU (no CUDA)")
 
     return config
 

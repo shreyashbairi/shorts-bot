@@ -11,6 +11,43 @@ import json
 import yaml
 
 
+def detect_cuda_available() -> bool:
+    """
+    Detect if CUDA is available on this system.
+
+    Returns:
+        True if CUDA is available, False otherwise
+    """
+    # Check via PyTorch (most reliable)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return True
+    except ImportError:
+        pass
+
+    # Check via ctranslate2
+    try:
+        import ctranslate2
+        supported = ctranslate2.get_supported_compute_types("cuda")
+        if supported:
+            return True
+    except (ImportError, RuntimeError, Exception):
+        pass
+
+    return False
+
+
+def get_default_gpu_enabled() -> bool:
+    """
+    Get the default value for gpu_enabled based on system capabilities.
+
+    Returns:
+        True if CUDA GPU is available, False otherwise
+    """
+    return detect_cuda_available()
+
+
 class Platform(Enum):
     """Supported output platforms."""
     YOUTUBE_SHORTS = "youtube_shorts"
@@ -214,7 +251,7 @@ class Config:
 
     # Performance
     num_workers: int = 4
-    gpu_enabled: bool = True
+    gpu_enabled: bool = field(default_factory=get_default_gpu_enabled)
 
     def __post_init__(self):
         """Initialize platform preset if not provided."""
@@ -328,7 +365,50 @@ class Config:
         return issues
 
 
-# Default presets for quick setup
+def get_preset_config(preset_name: str) -> "Config":
+    """
+    Get a preset configuration with proper GPU auto-detection.
+
+    Args:
+        preset_name: One of 'fast', 'balanced', 'quality', 'max_quality'
+
+    Returns:
+        Config object with appropriate settings
+    """
+    gpu_available = get_default_gpu_enabled()
+
+    presets = {
+        "fast": Config(
+            transcription=TranscriptionConfig(model=WhisperModel.TINY),
+            clipping=ClippingConfig(preset="ultrafast", smart_framing=False),
+            gpu_enabled=gpu_available,
+        ),
+        "balanced": Config(
+            transcription=TranscriptionConfig(model=WhisperModel.BASE),
+            clipping=ClippingConfig(preset="medium"),
+            gpu_enabled=gpu_available,
+        ),
+        "quality": Config(
+            transcription=TranscriptionConfig(model=WhisperModel.MEDIUM),
+            clipping=ClippingConfig(preset="slow", crf=18),
+            gpu_enabled=gpu_available,
+        ),
+        "max_quality": Config(
+            transcription=TranscriptionConfig(model=WhisperModel.LARGE_V3),
+            clipping=ClippingConfig(preset="slow", crf=15),
+            caption=CaptionConfig(style=CaptionStyle.VIRAL),
+            gpu_enabled=gpu_available,
+        ),
+    }
+
+    if preset_name not in presets:
+        raise ValueError(f"Unknown preset: {preset_name}. Available: {list(presets.keys())}")
+
+    return presets[preset_name]
+
+
+# Default presets for quick setup (use get_preset_config() for proper GPU detection)
+# These are kept for backward compatibility but may not auto-detect GPU correctly
 PRESET_CONFIGS = {
     "fast": Config(
         transcription=TranscriptionConfig(model=WhisperModel.TINY),

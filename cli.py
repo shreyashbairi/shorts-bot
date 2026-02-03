@@ -19,7 +19,7 @@ from typing import Optional
 
 from src.core.config import (
     Config, Platform, CaptionStyle, WhisperModel,
-    PRESET_CONFIGS
+    PRESET_CONFIGS, get_preset_config
 )
 from src.core.pipeline import Pipeline, PipelineStage
 from src.core.logger import setup_global_logging, get_logger
@@ -112,9 +112,9 @@ Examples:
 
 def build_config(args: argparse.Namespace) -> Config:
     """Build configuration from command line arguments."""
-    # Start with preset or default
+    # Start with preset or default (use get_preset_config for proper GPU detection)
     if hasattr(args, 'preset') and args.preset:
-        config = PRESET_CONFIGS[args.preset]
+        config = get_preset_config(args.preset)
     elif hasattr(args, 'config') and args.config:
         config = Config.from_file(Path(args.config))
     else:
@@ -355,14 +355,20 @@ def cmd_transcribe(args: argparse.Namespace) -> int:
 def cmd_config(args: argparse.Namespace) -> int:
     """Handle the config command."""
     if args.generate:
-        config = PRESET_CONFIGS.get(args.preset, Config())
+        try:
+            config = get_preset_config(args.preset)
+        except ValueError:
+            config = Config()
         output_path = Path(args.generate)
         config.save(output_path)
         print(f"Configuration saved to: {output_path}")
         return 0
     else:
         # Show current default config
-        config = PRESET_CONFIGS.get(args.preset, Config())
+        try:
+            config = get_preset_config(args.preset)
+        except ValueError:
+            config = Config()
         import json
         print(json.dumps(config.to_dict(), indent=2))
         return 0
