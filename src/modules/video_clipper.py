@@ -564,6 +564,83 @@ class VideoClipper:
 
         return output_path
 
+    def concatenate_clips(
+        self,
+        clip_paths: List[Path],
+        output_prefix: str = "combined"
+    ) -> Path:
+        """
+        Concatenate multiple video clips into a single video.
+
+        Args:
+            clip_paths: List of video file paths to concatenate
+            output_prefix: Prefix for output filename
+
+        Returns:
+            Path to concatenated video
+        """
+        if not clip_paths:
+            raise ValueError("At least one clip path is required")
+
+        if len(clip_paths) == 1:
+            return clip_paths[0]
+
+        output_path = self.output_dir / f"{output_prefix}.{self.clip_config.output_format}"
+
+        # Create a temporary file list for FFmpeg concat demuxer
+        concat_file = self.temp_dir / "concat_list.txt"
+
+        with open(concat_file, 'w') as f:
+            for clip_path in clip_paths:
+                # Escape single quotes and write file path
+                escaped_path = str(clip_path).replace("'", "'\\''")
+                f.write(f"file '{escaped_path}'\n")
+
+        logger.info(f"Concatenating {len(clip_paths)} clips into {output_path.name}")
+
+        # Use FFmpeg concat demuxer
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', str(concat_file),
+            '-c', 'copy',  # Copy streams without re-encoding
+            str(output_path)
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+        except subprocess.CalledProcessError as e:
+            # If copy fails (different codecs), try re-encoding
+            logger.warning("Direct copy failed, re-encoding clips")
+            cmd = [
+                'ffmpeg', '-y',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', str(concat_file),
+                '-c:v', self.clip_config.codec,
+                '-preset', self.clip_config.preset,
+                '-crf', str(self.clip_config.crf),
+                '-c:a', self.clip_config.audio_codec,
+                '-b:a', self.platform.audio_bitrate,
+                str(output_path)
+            ]
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+        # Clean up concat file
+        try:
+            concat_file.unlink()
+        except:
+            pass
+
+        logger.info(f"Created concatenated video: {output_path.name}")
+        return output_path
+
     def cleanup(self):
         """Clean up temporary files."""
         if not self.config.keep_temp_files:

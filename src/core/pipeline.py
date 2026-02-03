@@ -523,6 +523,146 @@ class Pipeline:
 
         return clip
 
+    def create_multi_segment_clip(
+        self,
+        file_path: Path,
+        segments: List[Dict[str, float]],
+        output_path: Optional[Path] = None,
+        add_captions: bool = True
+    ) -> ClipResult:
+        """
+        Create a single clip from multiple segments concatenated together.
+
+        Args:
+            file_path: Source video path
+            segments: List of dicts with 'start' and 'end' times in seconds
+            output_path: Optional output path
+            add_captions: Whether to add captions
+
+        Returns:
+            ClipResult with concatenated video
+        """
+        if not segments:
+            raise ValueError("At least one segment is required")
+
+        input_file = self.input_handler.process_file(file_path)
+
+        # Get transcript if we need captions
+        transcript = None
+        if add_captions and input_file.audio_path:
+            transcript = self.transcriber.transcribe(input_file.audio_path)
+
+        # Create individual clips for each segment
+        temp_clips = []
+        for i, seg in enumerate(segments):
+            highlight = Highlight(
+                start=seg['start'],
+                end=seg['end'],
+                text="",
+                score=1.0,
+                reasons=[]
+            )
+
+            clips = self.video_clipper.create_clips(
+                source_path=file_path,
+                highlights=[highlight],
+                output_prefix=f"segment_{i}"
+            )
+
+            if clips:
+                temp_clips.append(clips[0])
+
+        if not temp_clips:
+            raise RuntimeError("Failed to create any clips")
+
+        # If only one segment, just return that clip (optionally with captions)
+        if len(temp_clips) == 1:
+            clip = temp_clips[0]
+            if add_captions and transcript:
+                captions = self.caption_generator.generate_captions(
+                    transcript=transcript,
+                    clip_start=segments[0]['start'],
+                    clip_end=segments[0]['end']
+                )
+                captioned_path = self.caption_generator.burn_captions(
+                    video_path=clip.path,
+                    captions=captions,
+                    output_path=output_path
+                )
+                clip.path = captioned_path
+            return clip
+
+        # Concatenate multiple clips
+        concatenated_path = self.video_clipper.concatenate_clips(
+            clip_paths=[c.path for c in temp_clips],
+            output_prefix="combined_clip"
+        )
+
+        # Calculate total duration
+        total_duration = sum(seg['end'] - seg['start'] for seg in segments)
+
+        # Get video info for dimensions
+        from ..utils.video_utils import get_video_info
+        concat_info = get_video_info(concatenated_path)
+
+        # Create result for concatenated clip
+        combined_highlight = Highlight(
+            start=0,
+            end=total_duration,
+            text="Combined from multiple segments",
+            score=1.0,
+            reasons=[],
+            metadata={'segments': segments}
+        )
+
+        final_clip = ClipResult(
+            path=concatenated_path,
+            highlight=combined_highlight,
+            duration=total_duration,
+            width=concat_info.width,
+            height=concat_info.height,
+            file_size=concatenated_path.stat().st_size if concatenated_path.exists() else 0,
+            metadata={'segment_count': len(segments)}
+        )
+
+        # Add captions if requested
+        if add_captions and transcript:
+            # Generate captions for all segments combined
+            all_captions = None
+            time_offset = 0
+            for seg in segments:
+                seg_captions = self.caption_generator.generate_captions(
+                    transcript=transcript,
+                    clip_start=seg['start'],
+                    clip_end=seg['end']
+                )
+                if all_captions is None:
+                    all_captions = seg_captions
+                else:
+                    # Merge captions with time offset
+                    all_captions = self.caption_generator.merge_captions(
+                        all_captions, seg_captions, time_offset
+                    )
+                time_offset += seg['end'] - seg['start']
+
+            if all_captions:
+                captioned_path = self.caption_generator.burn_captions(
+                    video_path=final_clip.path,
+                    captions=all_captions,
+                    output_path=output_path
+                )
+                final_clip.path = captioned_path
+
+        # Clean up temporary segment clips
+        for clip in temp_clips:
+            try:
+                if clip.path.exists():
+                    clip.path.unlink()
+            except Exception:
+                pass
+
+        return final_clip
+
     def cleanup(self):
         """Clean up all temporary files."""
         logger.info("Cleaning up temporary files")

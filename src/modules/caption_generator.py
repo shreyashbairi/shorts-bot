@@ -628,6 +628,51 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             duration=captions.duration
         )
 
+    def merge_captions(
+        self,
+        base_captions: CaptionSequence,
+        additional_captions: CaptionSequence,
+        time_offset: float
+    ) -> CaptionSequence:
+        """
+        Merge two caption sequences, adjusting timing for the second sequence.
+
+        Args:
+            base_captions: First caption sequence
+            additional_captions: Second caption sequence to append
+            time_offset: Time offset to apply to additional_captions
+
+        Returns:
+            Merged CaptionSequence
+        """
+        merged_lines = list(base_captions.lines)
+
+        # Add additional captions with time offset
+        for line in additional_captions.lines:
+            offset_line = CaptionLine(
+                text=line.text,
+                start=line.start + time_offset,
+                end=line.end + time_offset,
+                words=[
+                    {
+                        'text': w['text'],
+                        'start': w['start'] + time_offset,
+                        'end': w['end'] + time_offset
+                    }
+                    for w in line.words
+                ] if line.words else []
+            )
+            merged_lines.append(offset_line)
+
+        # Calculate total duration
+        total_duration = base_captions.duration + additional_captions.duration
+
+        return CaptionSequence(
+            lines=merged_lines,
+            style=base_captions.style,
+            duration=total_duration
+        )
+
     def cleanup(self):
         """Clean up temporary files."""
         if not self.config.keep_temp_files:
