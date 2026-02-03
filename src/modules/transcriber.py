@@ -163,6 +163,73 @@ class Transcriber:
         self.temp_dir = ensure_dir(config.temp_dir / "transcription")
         self.model = None
         self._backend = None
+        self._device = None
+        self._compute_type = None
+
+    @staticmethod
+    def _check_cuda_available() -> bool:
+        """
+        Check if CUDA is actually available for use.
+
+        Returns:
+            True if CUDA is available, False otherwise
+        """
+        # Check 1: Try torch CUDA
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return True
+        except ImportError:
+            pass
+
+        # Check 2: Try ctranslate2 directly
+        try:
+            import ctranslate2
+            # Check if CUDA device is available
+            if "cuda" in ctranslate2.get_supported_compute_types("cuda"):
+                return True
+        except (ImportError, RuntimeError, Exception):
+            pass
+
+        return False
+
+    def _get_device_and_compute_type(self) -> tuple:
+        """
+        Determine the best device and compute type for the current system.
+
+        Returns:
+            Tuple of (device, compute_type)
+        """
+        # If explicitly set to CPU, use CPU
+        if self.trans_config.device == "cpu":
+            return "cpu", "int8"
+
+        # If explicitly set to CUDA, check if available
+        if self.trans_config.device == "cuda":
+            if self._check_cuda_available():
+                compute_type = self.trans_config.compute_type
+                if compute_type == "auto":
+                    compute_type = "float16"
+                return "cuda", compute_type
+            else:
+                logger.warning("CUDA requested but not available, falling back to CPU")
+                return "cpu", "int8"
+
+        # Auto-detect: prefer CUDA if available and gpu_enabled
+        if self.trans_config.device == "auto" and self.config.gpu_enabled:
+            if self._check_cuda_available():
+                compute_type = self.trans_config.compute_type
+                if compute_type == "auto":
+                    compute_type = "float16"
+                return "cuda", compute_type
+
+        # Default to CPU
+        compute_type = self.trans_config.compute_type
+        if compute_type == "auto" or compute_type == "float16":
+            # float16 is not well supported on CPU, use int8 or float32
+            compute_type = "int8"
+
+        return "cpu", compute_type
 
     def _load_model(self):
         """Load the Whisper model (lazy loading)."""
@@ -176,24 +243,41 @@ class Transcriber:
         try:
             from faster_whisper import WhisperModel
 
-            # Determine compute type
-            compute_type = self.trans_config.compute_type
-            if compute_type == "auto":
-                compute_type = "float16" if self.config.gpu_enabled else "int8"
+            # Determine device and compute type with proper fallback
+            device, compute_type = self._get_device_and_compute_type()
 
-            # Determine device
-            device = self.trans_config.device
-            if device == "auto":
-                device = "cuda" if self.config.gpu_enabled else "cpu"
+            # Try to load with determined settings, fall back to CPU if CUDA fails
+            try:
+                self.model = WhisperModel(
+                    model_size,
+                    device=device,
+                    compute_type=compute_type
+                )
+                self._device = device
+                self._compute_type = compute_type
+                self._backend = "faster-whisper"
+                logger.info(f"Loaded faster-whisper model on {device} with {compute_type}")
+                return
 
-            self.model = WhisperModel(
-                model_size,
-                device=device,
-                compute_type=compute_type
-            )
-            self._backend = "faster-whisper"
-            logger.info(f"Loaded faster-whisper model on {device}")
-            return
+            except (ValueError, RuntimeError) as e:
+                # CUDA failed (not compiled with CUDA, out of memory, etc.)
+                if device == "cuda":
+                    logger.warning(f"Failed to load on CUDA ({e}), falling back to CPU")
+                    device = "cpu"
+                    compute_type = "int8"
+
+                    self.model = WhisperModel(
+                        model_size,
+                        device=device,
+                        compute_type=compute_type
+                    )
+                    self._device = device
+                    self._compute_type = compute_type
+                    self._backend = "faster-whisper"
+                    logger.info(f"Loaded faster-whisper model on {device} with {compute_type}")
+                    return
+                else:
+                    raise  # Re-raise if already on CPU
 
         except ImportError:
             logger.debug("faster-whisper not available, trying alternatives")
@@ -202,8 +286,18 @@ class Transcriber:
         try:
             import whisper
 
-            device = "cuda" if self.config.gpu_enabled else "cpu"
+            # Check CUDA availability for openai-whisper
+            device = "cpu"
+            if self.config.gpu_enabled and self._check_cuda_available():
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        device = "cuda"
+                except ImportError:
+                    pass
+
             self.model = whisper.load_model(model_size, device=device)
+            self._device = device
             self._backend = "openai-whisper"
             logger.info(f"Loaded openai-whisper model on {device}")
             return
