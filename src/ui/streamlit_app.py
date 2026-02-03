@@ -466,9 +466,9 @@ def render_preview_tab():
 
 
 def render_manual_clip_tab():
-    """Render the manual clipping tab."""
+    """Render the manual clipping tab with support for multiple segments."""
     st.markdown("## Manual Clip")
-    st.write("Create a clip with custom start and end times.")
+    st.write("Create clips with custom start and end times. Multiple segments will be concatenated into one final video.")
 
     uploaded_file = st.file_uploader(
         "Upload video",
@@ -477,18 +477,101 @@ def render_manual_clip_tab():
     )
 
     if uploaded_file:
+        # Initialize segment state
+        if 'num_segments' not in st.session_state:
+            st.session_state.num_segments = 1
+        if 'segments' not in st.session_state:
+            st.session_state.segments = [{'start': 0.0, 'end': 30.0}]
+
+        # Number of segments selector
+        num_segments = st.number_input(
+            "Number of Clips to Concatenate",
+            min_value=1,
+            max_value=20,
+            value=st.session_state.num_segments,
+            step=1,
+            help="Specify how many segments you want to combine into one video"
+        )
+
+        # Update segments list if number changed
+        if num_segments != st.session_state.num_segments:
+            st.session_state.num_segments = num_segments
+            # Adjust segments list
+            while len(st.session_state.segments) < num_segments:
+                last_end = st.session_state.segments[-1]['end'] if st.session_state.segments else 0
+                st.session_state.segments.append({'start': last_end, 'end': last_end + 30.0})
+            st.session_state.segments = st.session_state.segments[:num_segments]
+
+        st.markdown("---")
+        st.markdown("### Segment Times")
+
+        # Display segment inputs
+        segments = []
+        total_duration = 0
+        all_valid = True
+
+        for i in range(num_segments):
+            st.markdown(f"**Segment {i + 1}**")
+            col1, col2, col3 = st.columns([2, 2, 1])
+
+            # Get current values
+            current_start = st.session_state.segments[i]['start'] if i < len(st.session_state.segments) else 0.0
+            current_end = st.session_state.segments[i]['end'] if i < len(st.session_state.segments) else 30.0
+
+            with col1:
+                start_time = st.number_input(
+                    f"Start (seconds)",
+                    min_value=0.0,
+                    value=current_start,
+                    step=0.5,
+                    key=f"start_{i}"
+                )
+            with col2:
+                end_time = st.number_input(
+                    f"End (seconds)",
+                    min_value=0.0,
+                    value=current_end,
+                    step=0.5,
+                    key=f"end_{i}"
+                )
+            with col3:
+                duration = end_time - start_time
+                if duration > 0:
+                    st.metric("Duration", f"{duration:.1f}s")
+                else:
+                    st.error("Invalid")
+                    all_valid = False
+
+            # Update session state
+            if i < len(st.session_state.segments):
+                st.session_state.segments[i] = {'start': start_time, 'end': end_time}
+            else:
+                st.session_state.segments.append({'start': start_time, 'end': end_time})
+
+            if end_time > start_time:
+                segments.append({'start': start_time, 'end': end_time})
+                total_duration += duration
+
+        st.markdown("---")
+
+        # Show total duration
         col1, col2 = st.columns(2)
         with col1:
-            start_time = st.number_input("Start Time (seconds)", min_value=0.0, value=0.0, step=0.5)
+            st.info(f"Total combined duration: **{total_duration:.1f} seconds**")
         with col2:
-            end_time = st.number_input("End Time (seconds)", min_value=0.0, value=30.0, step=0.5)
+            add_captions = st.checkbox("Add Captions", value=True, key="manual_captions")
 
-        add_captions = st.checkbox("Add Captions", value=True)
-
-        if st.button("✂️ Create Clip", type="primary"):
-            if end_time <= start_time:
-                st.error("End time must be greater than start time")
+        # Create clip button
+        if st.button("✂️ Create Combined Clip", type="primary", disabled=not all_valid):
+            if not all_valid or not segments:
+                st.error("Please fix invalid segments (end time must be greater than start time)")
                 return
+
+            # Validate segments
+            for i, seg in enumerate(segments):
+                if seg['end'] <= seg['start']:
+                    st.error(f"Segment {i + 1}: End time must be greater than start time")
+                    return
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix) as tmp_file:
                 tmp_file.write(uploaded_file.getvalue())
@@ -498,15 +581,24 @@ def render_manual_clip_tab():
                 config = st.session_state.config or Config()
                 pipeline = Pipeline(config)
 
-                with st.spinner("Creating clip..."):
-                    clip = pipeline.create_single_clip(
-                        file_path=tmp_path,
-                        start_time=start_time,
-                        end_time=end_time,
-                        add_captions=add_captions
-                    )
+                with st.spinner(f"Creating {len(segments)} segment(s) and concatenating..."):
+                    if len(segments) == 1:
+                        # Single segment - use existing method
+                        clip = pipeline.create_single_clip(
+                            file_path=tmp_path,
+                            start_time=segments[0]['start'],
+                            end_time=segments[0]['end'],
+                            add_captions=add_captions
+                        )
+                    else:
+                        # Multiple segments - use new method
+                        clip = pipeline.create_multi_segment_clip(
+                            file_path=tmp_path,
+                            segments=segments,
+                            add_captions=add_captions
+                        )
 
-                st.success(f"Clip created! Duration: {clip.duration:.1f}s")
+                st.success(f"Clip created! Total duration: {clip.duration:.1f}s ({len(segments)} segment(s))")
 
                 # Show and download
                 if clip.path.exists():
@@ -514,8 +606,9 @@ def render_manual_clip_tab():
                         video_bytes = f.read()
                         st.video(video_bytes)
 
+                    with open(clip.path, 'rb') as f:
                         st.download_button(
-                            "⬇️ Download Clip",
+                            "⬇️ Download Combined Clip",
                             f,
                             file_name=clip.path.name,
                             mime="video/mp4"
@@ -523,12 +616,28 @@ def render_manual_clip_tab():
 
             except Exception as e:
                 st.error(f"Error: {str(e)}")
+                logger.exception("Manual clip error")
 
             finally:
                 try:
                     tmp_path.unlink()
                 except:
                     pass
+
+        # Help section
+        with st.expander("How to use multiple segments"):
+            st.markdown("""
+            1. **Set the number of clips** you want to combine
+            2. **Enter start and end times** for each segment
+            3. Segments will be **concatenated in order** (Segment 1, then Segment 2, etc.)
+            4. Click **Create Combined Clip** to generate the final video
+
+            **Tips:**
+            - Segments don't need to be in chronological order
+            - You can pick any parts of the video to combine
+            - The final video will play segments in the order listed (1, 2, 3...)
+            - Use the Quick Preview tab to find interesting timestamps first
+            """)
 
 
 def main():

@@ -214,35 +214,44 @@ class HighlightDetector:
         Returns:
             Tuple of (score, reasons)
         """
-        score = 0.0
+        # Start with a base score so all segments have some value
+        score = 0.1
         reasons = []
         text_lower = segment.text.lower()
 
-        # Emotional content scoring
+        # Give a small bonus for segments with more content
+        word_count = len(segment.text.split())
+        if word_count >= 5:
+            score += 0.05
+        if word_count >= 10:
+            score += 0.05
+
+        # Emotional content scoring (use lower threshold)
         emotion_score = self._score_emotional_content(segment.text)
-        if emotion_score > 0.3:
+        if emotion_score > 0.1:
             score += emotion_score * self.hl_config.emotional_weight
-            reasons.append(HighlightReason.EMOTIONAL_PEAK)
+            if emotion_score > 0.2:
+                reasons.append(HighlightReason.EMOTIONAL_PEAK)
 
-        # Insight/key point scoring
+        # Insight/key point scoring (use lower threshold)
         insight_score = self._score_insights(segment.text)
-        if insight_score > 0.3:
+        if insight_score > 0.1:
             score += insight_score * self.hl_config.insight_weight
-            reasons.append(HighlightReason.KEY_INSIGHT)
+            if insight_score > 0.2:
+                reasons.append(HighlightReason.KEY_INSIGHT)
 
-        # Engagement scoring (questions, direct address)
+        # Engagement scoring (questions, direct address) (use lower threshold)
         engagement_score = self._score_engagement(segment.text)
-        if engagement_score > 0.3:
+        if engagement_score > 0.1:
             score += engagement_score * self.hl_config.engagement_weight
             if '?' in segment.text:
                 reasons.append(HighlightReason.ENGAGING_QUESTION)
 
-        # Pacing/energy scoring
+        # Pacing/energy scoring (always add some contribution)
         pacing_score = self._score_pacing(segment)
-        if pacing_score > 0.3:
-            score += pacing_score * self.hl_config.pacing_weight
-            if pacing_score > 0.6:
-                reasons.append(HighlightReason.HIGH_ENERGY)
+        score += pacing_score * self.hl_config.pacing_weight * 0.5
+        if pacing_score > 0.5:
+            reasons.append(HighlightReason.HIGH_ENERGY)
 
         # Story detection
         if self._is_story_moment(segment.text):
@@ -259,12 +268,12 @@ class HighlightDetector:
             score += 0.1
             reasons.append(HighlightReason.QUOTABLE)
 
-        # Penalize segments with too many filler words
-        filler_penalty = self._calculate_filler_penalty(segment.text)
+        # Penalize segments with too many filler words (but less severely)
+        filler_penalty = self._calculate_filler_penalty(segment.text) * 0.5
         score -= filler_penalty
 
-        # Normalize score to 0-1 range
-        score = max(0.0, min(1.0, score))
+        # Normalize score to 0-1 range (ensure minimum of 0.05)
+        score = max(0.05, min(1.0, score))
 
         return score, reasons
 
@@ -495,33 +504,44 @@ class HighlightDetector:
                     overlap += overlap_end - overlap_start
             return overlap / (end - start) if end > start else 0
 
+        # Determine score threshold dynamically
+        # Use a lower threshold to ensure we find highlights
+        if sorted_scores:
+            max_score = sorted_scores[0]['score']
+            # Use 10% of max score as minimum threshold, with floor of 0.05
+            score_threshold = max(0.05, max_score * 0.1)
+        else:
+            score_threshold = 0.05
+
+        logger.debug(f"Using score threshold: {score_threshold:.3f}")
+
         for scored in sorted_scores:
             if len(highlights) >= self.hl_config.target_clips * 2:  # Get extra, we'll trim later
                 break
 
             segment = scored['segment']
 
-            # Skip low-scoring segments
-            if scored['score'] < 0.3:
+            # Skip very low-scoring segments (use dynamic threshold)
+            if scored['score'] < score_threshold:
                 continue
 
             # Try to expand this segment into a full clip
             clip_start = segment.start
             clip_end = segment.end
 
-            # Find adjacent high-scoring segments to include
+            # Find adjacent segments to include (more lenient scoring)
             for other_scored in segment_scores:
                 other = other_scored['segment']
                 if other.id == segment.id:
                     continue
 
-                # Check if adjacent and high-enough score
+                # Check if adjacent (within 2 seconds) and has any positive score
                 is_adjacent = (
-                    abs(other.end - clip_start) < 1.0 or
-                    abs(other.start - clip_end) < 1.0
+                    abs(other.end - clip_start) < 2.0 or
+                    abs(other.start - clip_end) < 2.0
                 )
 
-                if is_adjacent and other_scored['score'] > 0.2:
+                if is_adjacent and other_scored['score'] > 0.0:
                     new_start = min(clip_start, other.start)
                     new_end = max(clip_end, other.end)
 
@@ -537,21 +557,23 @@ class HighlightDetector:
             # Check duration
             duration = clip_end - clip_start
             if duration < min_duration:
-                # Try to extend
+                # Try to extend more aggressively
                 needed = min_duration - duration
-                clip_start = max(0, clip_start - needed / 2)
-                clip_end = min(total_duration, clip_end + needed / 2)
+                clip_start = max(0, clip_start - needed)
+                clip_end = min(total_duration, clip_end + needed)
                 duration = clip_end - clip_start
 
-            if duration < min_duration or duration > max_duration:
+            # If still too short but video is short, allow shorter clips
+            effective_min = min(min_duration, total_duration * 0.5)
+            if duration < effective_min or duration > max_duration:
                 continue
 
             # Skip if overlaps with already selected highlights
             if overlaps_used(clip_start, clip_end):
                 continue
 
-            # Skip if too much overlap with fillers/silence
-            if overlaps_filler(clip_start, clip_end) > 0.3:
+            # Be more lenient with filler overlap (50% instead of 30%)
+            if overlaps_filler(clip_start, clip_end) > 0.5:
                 continue
 
             # Get text for this clip range
@@ -565,6 +587,10 @@ class HighlightDetector:
             all_reasons = set()
             for s in clip_segments:
                 all_reasons.update(s['reasons'])
+
+            # If no reasons, add a generic one
+            if not all_reasons:
+                all_reasons.add(HighlightReason.KEY_INSIGHT)
 
             highlight = Highlight(
                 start=clip_start,
@@ -581,10 +607,85 @@ class HighlightDetector:
             highlights.append(highlight)
             used_ranges.append((clip_start, clip_end))
 
+        # Fallback: if no highlights found, create clips from the highest scoring segments
+        if not highlights and sorted_scores:
+            logger.info("No highlights met criteria, creating fallback clips from best segments")
+            highlights = self._create_fallback_clips(sorted_scores, total_duration, used_ranges)
+
         # Sort by time and return top N
         highlights = sorted(highlights, key=lambda h: h.score, reverse=True)
         highlights = highlights[:self.hl_config.target_clips]
         highlights = sorted(highlights, key=lambda h: h.start)
+
+        return highlights
+
+    def _create_fallback_clips(
+        self,
+        sorted_scores: List[Dict],
+        total_duration: float,
+        used_ranges: List[Tuple[float, float]]
+    ) -> List[Highlight]:
+        """
+        Create fallback clips when normal detection fails.
+
+        This ensures we always return some highlights by being very lenient
+        with scoring and duration requirements.
+        """
+        highlights = []
+        min_duration = min(self.hl_config.min_clip_duration, max(5, total_duration * 0.3))
+        max_duration = self.hl_config.max_clip_duration
+
+        def overlaps_used(start: float, end: float) -> bool:
+            for used_start, used_end in used_ranges:
+                if start < used_end and end > used_start:
+                    return True
+            return False
+
+        for scored in sorted_scores[:self.hl_config.target_clips * 3]:
+            if len(highlights) >= self.hl_config.target_clips:
+                break
+
+            segment = scored['segment']
+            clip_start = max(0, segment.start - 1.0)
+            clip_end = min(total_duration, segment.end + 1.0)
+
+            # Extend to meet minimum duration
+            duration = clip_end - clip_start
+            if duration < min_duration:
+                needed = min_duration - duration
+                clip_start = max(0, clip_start - needed / 2)
+                clip_end = min(total_duration, clip_end + needed / 2)
+                duration = clip_end - clip_start
+
+            # Skip if still too short or too long
+            if duration < 3 or duration > max_duration:
+                continue
+
+            # Skip if overlaps
+            if overlaps_used(clip_start, clip_end):
+                continue
+
+            # Get text for this range
+            clip_text = segment.text
+            reasons = scored.get('reasons', [])
+            if not reasons:
+                reasons = [HighlightReason.KEY_INSIGHT]
+
+            highlight = Highlight(
+                start=clip_start,
+                end=clip_end,
+                text=clip_text,
+                score=max(scored['score'], 0.1),  # Ensure minimum score
+                reasons=reasons,
+                metadata={
+                    'segment_count': 1,
+                    'primary_segment_id': segment.id,
+                    'fallback': True
+                }
+            )
+
+            highlights.append(highlight)
+            used_ranges.append((clip_start, clip_end))
 
         return highlights
 
