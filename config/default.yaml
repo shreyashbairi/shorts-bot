@@ -1,0 +1,113 @@
+# Shorts Bot - Default Configuration
+# Copy this file and customize as needed
+
+# Target platform
+platform: youtube_shorts  # youtube_shorts, instagram_reels, tiktok
+
+# Directories (relative to project root)
+input_dir: input
+output_dir: output
+temp_dir: temp
+models_dir: models
+
+# Transcription settings
+transcription:
+  model: base  # tiny, base, small, medium, large, large-v2, large-v3
+  language: null  # null for auto-detect, or language code like 'en', 'es', 'fr'
+  task: transcribe  # transcribe or translate
+  word_timestamps: true
+  vad_filter: true  # Voice Activity Detection
+  device: auto  # cpu, cuda, auto
+  compute_type: auto  # float16, int8, auto
+  batch_size: 16
+
+# Highlight detection settings
+highlight:
+  min_clip_duration: 15  # seconds
+  max_clip_duration: 60  # seconds
+  target_clips: 5
+
+  # Scoring weights (should sum to 1.0)
+  emotional_weight: 0.3
+  insight_weight: 0.3
+  engagement_weight: 0.2
+  pacing_weight: 0.2
+
+  # Filler word handling
+  remove_fillers: true
+  filler_aggressiveness: 0.5  # 0-1, higher = more aggressive
+  filler_words:
+    - um
+    - uh
+    - er
+    - ah
+    - like
+    - you know
+    - basically
+    - actually
+    - literally
+    - sort of
+    - kind of
+    - i mean
+    - right
+    - so
+    - well
+    - anyway
+    - honestly
+
+  # Content analysis
+  use_llm: false  # Use local LLM for better analysis
+  llm_model: mistral  # ollama model name
+
+  # Silence detection
+  min_silence_duration: 0.5  # seconds
+  silence_threshold: -40  # dB
+
+# Video clipping settings
+clipping:
+  output_format: mp4
+  codec: libx264
+  audio_codec: aac
+  preset: medium  # ultrafast, fast, medium, slow
+  crf: 23  # Quality (0-51, lower = better)
+
+  # Smart framing
+  smart_framing: true
+  face_detection: true
+  face_detection_confidence: 0.5
+  tracking_smoothness: 0.3
+  fallback_crop: center  # center, top, bottom
+
+  # Padding for context
+  clip_padding_start: 0.5  # seconds
+  clip_padding_end: 0.5  # seconds
+
+# Caption settings
+caption:
+  style: viral  # minimal, bold, viral, subtitle, karaoke
+  font_name: Arial-Bold
+  font_size: 60
+  font_color: "#FFFFFF"
+  stroke_color: "#000000"
+  stroke_width: 3
+  highlight_color: "#FFFF00"
+  highlight_current_word: true
+  position: center  # top, center, bottom
+  margin_bottom: 200
+  max_words_per_line: 4
+  animation: pop  # none, pop, fade, bounce
+  uppercase: true
+  add_emoji: false
+  shadow: true
+  shadow_color: "#000000"
+  shadow_offset: 4
+
+# Pipeline settings
+batch_mode: false
+keep_temp_files: false
+overwrite_existing: false
+export_json: true  # Export metadata for automation
+
+# Performance
+num_workers: 4
+gpu_enabled: true
