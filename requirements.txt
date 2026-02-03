@@ -1,0 +1,36 @@
+# Shorts Bot - Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core transcription (choose one)
+faster-whisper>=0.10.0  # Recommended: faster inference
+# openai-whisper>=20231117  # Alternative: original implementation
+
+# Video processing
+opencv-python>=4.8.0  # Face detection
+opencv-python-headless>=4.8.0  # Alternative for servers (no GUI)
+
+# Web interface
+streamlit>=1.28.0
+
+# Configuration
+pyyaml>=6.0
+
+# Utilities
+tqdm>=4.65.0  # Progress bars
+numpy>=1.24.0
+
+# Optional: GPU support (install separately based on your CUDA version)
+# torch>=2.0.0
+# ctranslate2>=3.20.0  # For faster-whisper GPU
+
+# Optional: URL downloads
+# yt-dlp>=2023.10.13
+
+# Optional: Better audio processing
+# librosa>=0.10.0
+# soundfile>=0.12.0
+
+# Development
+# pytest>=7.4.0
+# black>=23.9.0
+# flake8>=6.1.0
