@@ -104,3 +104,4 @@ config/secrets.yaml
 # Editor files
 *.sublime-project
 *.sublime-workspace
+CODE_DETAIL.md
