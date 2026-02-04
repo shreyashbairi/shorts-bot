@@ -196,14 +196,15 @@ class HighlightConfig:
 
     # Content analysis with LLM
     use_llm: bool = False  # Use local LLM for better analysis
-    llm_model: str = "llama3.1:8b-instruct-q4_K_M"  # Model name/path
+    llm_model: str = "llama3.1:8b-instruct-q5_K_M"  # Model name/path
     llm_backend: str = "llama_cpp"  # llama_cpp, ollama
-    llm_model_path: Optional[str] = None  # Path to GGUF file (for llama_cpp)
-    llm_n_ctx: int = 2048  # Context window size
+    llm_model_path: Optional[str] = "models/Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf"  # Path to GGUF file
+    llm_n_ctx: int = 8192  # Context window size (larger for full transcript analysis)
     llm_n_threads: int = 6  # Number of CPU threads
     llm_n_gpu_layers: int = -1  # -1 = all layers on GPU (Metal on M2)
-    llm_temperature: float = 0.1  # Lower = more deterministic
-    llm_max_tokens: int = 256  # Max response tokens
+    llm_temperature: float = 0.3  # Slightly higher for creative highlight selection
+    llm_max_tokens: int = 1024  # More tokens for detailed analysis
+    llm_full_analysis: bool = True  # Use LLM as primary highlight detector (not just refinement)
 
     # Silence detection
     min_silence_duration: float = 0.5  # seconds

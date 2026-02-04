@@ -217,8 +217,8 @@ def render_sidebar():
 
             llm_model_path = st.text_input(
                 "Model Path (GGUF file)",
-                placeholder="models/llama-3.1-8b-instruct-q4_K_M.gguf",
-                help="Path to the GGUF model file. Leave empty for auto-detection."
+                value="models/Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf",
+                help="Path to the GGUF model file (Q5_K_M recommended for quality)"
             )
 
     # Build config from settings (use get_preset_config for proper GPU detection)
@@ -542,6 +542,88 @@ def render_manual_clip_tab():
     )
 
     if uploaded_file:
+        # LLM-powered cohesive clip creation
+        config = st.session_state.config
+        llm_available = config and config.highlight.use_llm
+
+        if llm_available:
+            st.markdown("### AI-Powered Clip Creation")
+            st.write("Let the LLM analyze your video and create a cohesive clip by selecting the best segments.")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                target_duration = st.number_input(
+                    "Target Duration (seconds)",
+                    min_value=15,
+                    max_value=180,
+                    value=60,
+                    help="The LLM will select segments that add up to approximately this duration"
+                )
+            with col2:
+                ai_captions = st.checkbox("Add Captions", value=True, key="ai_captions")
+
+            if st.button("🤖 Create AI-Powered Clip", type="primary"):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix) as tmp_file:
+                    tmp_file.write(uploaded_file.getvalue())
+                    tmp_path = Path(tmp_file.name)
+
+                try:
+                    pipeline = Pipeline(config)
+
+                    with st.spinner("Transcribing and analyzing video with LLM..."):
+                        # First transcribe
+                        input_file = pipeline.input_handler.process_file(tmp_path)
+                        if input_file.audio_path:
+                            transcript = pipeline.transcriber.transcribe(input_file.audio_path)
+
+                            # Use LLM to create cohesive clip plan
+                            segments = pipeline.highlight_detector.create_cohesive_clip(
+                                transcript,
+                                target_duration=float(target_duration)
+                            )
+
+                            if segments:
+                                st.success(f"LLM selected {len(segments)} segments for a cohesive narrative")
+
+                                # Show what the LLM selected
+                                for i, seg in enumerate(segments):
+                                    purpose = seg.get('purpose', '')
+                                    st.write(f"**Segment {i+1}**: {seg['start']:.1f}s - {seg['end']:.1f}s ({purpose})")
+
+                                # Create the clip
+                                with st.spinner("Creating combined clip..."):
+                                    clip = pipeline.create_multi_segment_clip(
+                                        file_path=tmp_path,
+                                        segments=segments,
+                                        add_captions=ai_captions
+                                    )
+
+                                st.success(f"Clip created! Duration: {clip.duration:.1f}s")
+
+                                if clip.path.exists():
+                                    with open(clip.path, 'rb') as f:
+                                        st.video(f.read())
+                                    with open(clip.path, 'rb') as f:
+                                        st.download_button("⬇️ Download AI Clip", f, file_name=clip.path.name, mime="video/mp4")
+                            else:
+                                st.error("LLM could not create a cohesive clip. Try manual selection below.")
+                        else:
+                            st.error("Could not extract audio from video")
+
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+                    logger.exception("AI clip creation error")
+                finally:
+                    try:
+                        tmp_path.unlink()
+                    except:
+                        pass
+
+            st.markdown("---")
+            st.markdown("### Or Create Manual Clip")
+        else:
+            st.info("Enable 'Use LLM for Better Highlights' in sidebar to unlock AI-powered clip creation")
+
         # Initialize segment state
         if 'num_segments' not in st.session_state:
             st.session_state.num_segments = 1
