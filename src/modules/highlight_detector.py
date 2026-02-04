@@ -689,6 +689,68 @@ class HighlightDetector:
 
         return highlights
 
+    def _init_llm(self):
+        """
+        Initialize the LLM for highlight refinement.
+
+        Supports llama-cpp-python with Metal acceleration for Apple Silicon
+        and Ollama as a fallback.
+        """
+        if hasattr(self, '_llm') and self._llm is not None:
+            return self._llm
+
+        self._llm = None
+
+        if self.hl_config.llm_backend == "llama_cpp":
+            try:
+                from llama_cpp import Llama
+
+                model_path = self.hl_config.llm_model_path
+                if model_path is None:
+                    # Try to find model in models directory
+                    models_dir = self.config.models_dir
+                    model_name = self.hl_config.llm_model.replace(":", "-")
+                    possible_paths = [
+                        models_dir / f"{model_name}.gguf",
+                        models_dir / "llama-3.1-8b-instruct-q4_K_M.gguf",
+                        models_dir / "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+                        Path.home() / ".cache" / "llama.cpp" / f"{model_name}.gguf",
+                    ]
+                    for p in possible_paths:
+                        if p.exists():
+                            model_path = str(p)
+                            break
+
+                if model_path is None or not Path(model_path).exists():
+                    logger.warning(f"LLM model file not found. Please download the model and place it in {self.config.models_dir}")
+                    logger.info("You can download from: https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF")
+                    return None
+
+                logger.info(f"Loading LLM model from {model_path}")
+                logger.info(f"Using Metal acceleration: n_gpu_layers={self.hl_config.llm_n_gpu_layers}")
+
+                # Initialize with Apple M2 optimizations
+                self._llm = Llama(
+                    model_path=model_path,
+                    n_ctx=self.hl_config.llm_n_ctx,
+                    n_threads=self.hl_config.llm_n_threads,
+                    n_gpu_layers=self.hl_config.llm_n_gpu_layers,  # -1 = all on Metal
+                    verbose=False,
+                    use_mmap=True,  # Memory-mapped for efficiency
+                    use_mlock=False,  # Don't lock memory on macOS
+                )
+
+                logger.info("LLM initialized successfully with Metal acceleration")
+                return self._llm
+
+            except ImportError:
+                logger.warning("llama-cpp-python not installed. Install with: pip install llama-cpp-python")
+            except Exception as e:
+                logger.warning(f"Failed to initialize llama-cpp: {e}")
+
+        # Fallback to None (will use Ollama in _refine_with_llm)
+        return None
+
     def _refine_with_llm(
         self,
         highlights: List[Highlight],
@@ -697,6 +759,8 @@ class HighlightDetector:
         """
         Use local LLM to refine highlight selection.
 
+        Supports llama-cpp-python (with Metal on Apple Silicon) and Ollama.
+
         Args:
             highlights: Initial highlights
             transcript: Full transcript
@@ -704,6 +768,63 @@ class HighlightDetector:
         Returns:
             Refined highlights
         """
+        if not highlights:
+            return highlights
+
+        # Try llama-cpp-python first (faster on Apple Silicon with Metal)
+        if self.hl_config.llm_backend == "llama_cpp":
+            llm = self._init_llm()
+            if llm is not None:
+                return self._refine_with_llama_cpp(highlights, transcript, llm)
+
+        # Fallback to Ollama
+        return self._refine_with_ollama(highlights, transcript)
+
+    def _refine_with_llama_cpp(
+        self,
+        highlights: List[Highlight],
+        transcript: Transcript,
+        llm
+    ) -> List[Highlight]:
+        """Refine highlights using llama-cpp-python."""
+        try:
+            prompt = self._create_llm_prompt(highlights, transcript)
+
+            # Format for Llama 3.1 Instruct
+            formatted_prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+You are a video content analyst. Analyze video clips and rate their viral potential. Be concise and respond only with scores.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+"""
+
+            logger.debug("Running LLM inference with Metal acceleration")
+
+            response = llm(
+                formatted_prompt,
+                max_tokens=self.hl_config.llm_max_tokens,
+                temperature=self.hl_config.llm_temperature,
+                stop=["<|eot_id|>", "<|end_of_text|>"],
+                echo=False,
+            )
+
+            response_text = response['choices'][0]['text'].strip()
+            logger.debug(f"LLM response: {response_text}")
+
+            highlights = self._parse_llm_response(highlights, response_text)
+
+        except Exception as e:
+            logger.warning(f"LLM refinement with llama-cpp failed: {e}")
+
+        return highlights
+
+    def _refine_with_ollama(
+        self,
+        highlights: List[Highlight],
+        transcript: Transcript
+    ) -> List[Highlight]:
+        """Refine highlights using Ollama as fallback."""
         try:
             import subprocess
 
@@ -721,23 +842,27 @@ class HighlightDetector:
             # Create prompt for LLM
             prompt = self._create_llm_prompt(highlights, transcript)
 
+            # Get model name (convert llama_cpp format to ollama format if needed)
+            model_name = self.hl_config.llm_model
+            if "q4_K_M" in model_name.lower():
+                model_name = "llama3.1:8b"  # Ollama naming
+
             # Call ollama
             result = subprocess.run(
-                ['ollama', 'run', self.hl_config.llm_model, prompt],
+                ['ollama', 'run', model_name, prompt],
                 capture_output=True,
                 text=True,
-                timeout=60
+                timeout=120
             )
 
             if result.returncode == 0:
-                # Parse LLM response to adjust scores
                 response = result.stdout
                 highlights = self._parse_llm_response(highlights, response)
 
         except subprocess.TimeoutExpired:
-            logger.warning("LLM request timed out")
+            logger.warning("Ollama request timed out")
         except Exception as e:
-            logger.warning(f"LLM refinement failed: {e}")
+            logger.warning(f"Ollama refinement failed: {e}")
 
         return highlights
 
@@ -747,15 +872,16 @@ class HighlightDetector:
         transcript: Transcript
     ) -> str:
         """Create prompt for LLM analysis."""
-        prompt = """Analyze these video clip candidates and rate them for viral potential on a scale of 1-10.
-Consider: emotional impact, shareability, clarity of message, hook potential.
+        prompt = """Rate these video clip candidates for viral potential (1-10).
+Consider: emotional impact, shareability, hook strength, clarity.
 
 Clips:
 """
         for i, h in enumerate(highlights, 1):
-            prompt += f"\n{i}. [{h.duration:.1f}s] \"{h.text[:200]}...\"\n"
+            text_preview = h.text[:200] + "..." if len(h.text) > 200 else h.text
+            prompt += f"\n{i}. [{h.duration:.1f}s] \"{text_preview}\"\n"
 
-        prompt += "\nRespond with just the clip numbers and scores, e.g.: 1:8, 2:6, 3:9"
+        prompt += "\nRespond with ONLY clip numbers and scores like: 1:8, 2:6, 3:9"
 
         return prompt
 
@@ -766,7 +892,7 @@ Clips:
     ) -> List[Highlight]:
         """Parse LLM response to adjust highlight scores."""
         # Extract scores from response
-        score_pattern = r'(\d+)\s*:\s*(\d+)'
+        score_pattern = r'(\d+)\s*[:\-]\s*(\d+)'
         matches = re.findall(score_pattern, response)
 
         for clip_num, score in matches:
@@ -779,6 +905,7 @@ Clips:
                     original = highlights[idx].score
                     highlights[idx].score = (original + llm_score) / 2
                     highlights[idx].metadata['llm_score'] = llm_score
+                    logger.debug(f"Clip {clip_num}: original={original:.2f}, llm={llm_score:.2f}, final={highlights[idx].score:.2f}")
 
             except (ValueError, IndexError):
                 continue
