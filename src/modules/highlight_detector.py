@@ -1036,15 +1036,10 @@ Return ONLY the JSON array, no other text."""
                     # Try to find model in models directory
                     models_dir = self.config.models_dir
                     possible_paths = [
-                        # Default Q5_K_M model
+                        models_dir / f"{model_name}.gguf",
                         models_dir / "Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf",
-                        # Alternative names
-                        models_dir / "llama-3.1-8b-instruct-q5_K_M.gguf",
-                        models_dir / "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
-                        models_dir / "llama-3.1-8b-instruct-q4_K_M.gguf",
-                        # Project root models folder
-                        Path("models") / "Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf",
-                        Path("models") / "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+                        models_dir / "Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf",
+                        Path.home() / ".cache" / "llama.cpp" / f"{model_name}.gguf",
                     ]
                     model_path = None
                     for p in possible_paths:
@@ -1178,7 +1173,7 @@ Return ONLY the JSON array, no other text."""
 
             # Get model name (convert llama_cpp format to ollama format if needed)
             model_name = self.hl_config.llm_model
-            if "q4_K_M" in model_name.lower():
+            if "q5_K_M" in model_name.lower():
                 model_name = "llama3.1:8b"  # Ollama naming
 
             # Call ollama
