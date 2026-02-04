@@ -198,6 +198,29 @@ def render_sidebar():
             help="Leave empty for auto-detection"
         )
 
+        st.markdown("---")
+        st.markdown("**LLM Highlight Analysis**")
+
+        use_llm = st.checkbox(
+            "Use LLM for Better Highlights",
+            value=False,
+            help="Use local Llama 3.1 model to improve highlight detection (requires model download)"
+        )
+
+        if use_llm:
+            llm_backend = st.selectbox(
+                "LLM Backend",
+                options=["llama_cpp", "ollama"],
+                index=0,
+                help="llama_cpp: Direct with Metal acceleration (faster on M2)\nollama: Uses Ollama service"
+            )
+
+            llm_model_path = st.text_input(
+                "Model Path (GGUF file)",
+                placeholder="models/llama-3.1-8b-instruct-q4_K_M.gguf",
+                help="Path to the GGUF model file. Leave empty for auto-detection."
+            )
+
     # Build config from settings (use get_preset_config for proper GPU detection)
     config = get_preset_config(preset_map[preset])
     config.update_for_platform(platform_map[platform])
@@ -208,23 +231,44 @@ def render_sidebar():
     config.clipping.smart_framing = smart_framing
     config.clipping.face_detection = smart_framing
 
+    # Caption settings
     if enable_captions:
         config.caption.style = caption_style_map[caption_style]
 
     if language:
         config.transcription.language = language
 
+    # LLM settings
+    if use_llm:
+        config.highlight.use_llm = True
+        config.highlight.llm_backend = llm_backend
+        if llm_model_path:
+            config.highlight.llm_model_path = llm_model_path
+        # Apple M2 optimizations
+        config.highlight.llm_n_gpu_layers = -1  # All layers on Metal
+        config.highlight.llm_n_threads = 6  # Good for M2
+        config.highlight.llm_n_ctx = 2048
+    else:
+        config.highlight.use_llm = False
+
     st.session_state.config = config
     st.session_state.enable_captions = enable_captions
 
-    # Show GPU status in sidebar
+    # Show GPU/Metal status in sidebar
     gpu_available = get_default_gpu_enabled()
     st.sidebar.markdown("---")
     st.sidebar.markdown("### System Info")
+
+    # Check for Apple Silicon
+    import platform as plat
+    is_apple_silicon = plat.processor() == 'arm' and plat.system() == 'Darwin'
+
     if gpu_available:
         st.sidebar.success("GPU: CUDA Available")
+    elif is_apple_silicon:
+        st.sidebar.success("GPU: Apple Metal (M-series)")
     else:
-        st.sidebar.info("GPU: Using CPU (no CUDA)")
+        st.sidebar.info("GPU: Using CPU")
 
     return config
 
@@ -254,6 +298,13 @@ def render_main_content():
             st.metric("File Size", f"{size_mb:.1f} MB")
         with col3:
             st.metric("Format", uploaded_file.type.split('/')[-1].upper())
+
+        # Show active configuration
+        config = st.session_state.config
+        if config:
+            llm_status = "LLM: On" if config.highlight.use_llm else "LLM: Off"
+            caption_status = f"Captions: {config.caption.style.value}" if st.session_state.get('enable_captions') else "Captions: Off"
+            st.caption(f"Settings: {config.highlight.target_clips} clips | {config.highlight.min_clip_duration}-{config.highlight.max_clip_duration}s | Whisper: {config.transcription.model.value} | {caption_status} | {llm_status}")
 
         st.markdown("---")
 
@@ -421,6 +472,7 @@ def render_preview_tab():
     """Render the highlight preview tab."""
     st.markdown("## Quick Preview")
     st.write("Get a quick preview of potential highlights without full processing.")
+    st.info("Uses configuration settings from sidebar (platform, caption style, LLM, etc.)")
 
     uploaded_file = st.file_uploader(
         "Upload video for preview",
@@ -435,10 +487,12 @@ def render_preview_tab():
                 tmp_path = Path(tmp_file.name)
 
             try:
-                config = Config()
+                # Use shared config from sidebar
+                config = st.session_state.config or Config()
                 pipeline = Pipeline(config)
 
-                with st.spinner("Analyzing video (this may take a moment)..."):
+                llm_status = " (with LLM)" if config.highlight.use_llm else ""
+                with st.spinner(f"Analyzing video{llm_status}..."):
                     highlights = pipeline.preview_highlights(tmp_path, quick_mode=True)
 
                 st.success(f"Found {len(highlights)} potential highlights!")
@@ -452,11 +506,15 @@ def render_preview_tab():
                             st.write(f"\"{h.text[:200]}...\"" if len(h.text) > 200 else f"\"{h.text}\"")
                         with col2:
                             st.metric("Score", f"{h.score:.2f}")
-                            st.write(", ".join(r.value for r in h.reasons[:2]))
+                            reasons_text = ", ".join(r.value for r in h.reasons[:2]) if h.reasons else "general"
+                            st.write(reasons_text)
+                            if h.metadata.get('llm_score'):
+                                st.caption(f"LLM: {h.metadata['llm_score']:.1f}")
                         st.markdown("---")
 
             except Exception as e:
                 st.error(f"Error: {str(e)}")
+                logger.exception("Preview error")
 
             finally:
                 try:
@@ -469,6 +527,13 @@ def render_manual_clip_tab():
     """Render the manual clipping tab with support for multiple segments."""
     st.markdown("## Manual Clip")
     st.write("Create clips with custom start and end times. Multiple segments will be concatenated into one final video.")
+
+    # Show active configuration
+    config = st.session_state.config
+    if config:
+        caption_status = f"Captions: {config.caption.style.value}" if st.session_state.get('enable_captions') else "Captions: Off"
+        preset_info = f"Quality: {config.clipping.preset} | Whisper: {config.transcription.model.value} | {caption_status}"
+        st.info(f"Using sidebar settings: {preset_info}")
 
     uploaded_file = st.file_uploader(
         "Upload video",
@@ -559,7 +624,9 @@ def render_manual_clip_tab():
         with col1:
             st.info(f"Total combined duration: **{total_duration:.1f} seconds**")
         with col2:
-            add_captions = st.checkbox("Add Captions", value=True, key="manual_captions")
+            # Default to sidebar setting
+            default_captions = st.session_state.get('enable_captions', True)
+            add_captions = st.checkbox("Add Captions", value=default_captions, key="manual_captions")
 
         # Create clip button
         if st.button("✂️ Create Combined Clip", type="primary", disabled=not all_valid):
