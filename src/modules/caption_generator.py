@@ -140,12 +140,11 @@ class CaptionGenerator:
         """Apply style preset defaults to caption config."""
         preset = self.STYLE_PRESETS.get(self.caption_config.style, {})
 
-        # Apply preset values only if not explicitly set
-        # (We can't easily detect "not set" with dataclasses, so we just use preset)
+        # Apply preset values to caption config
+        # This ensures each style looks visually distinct
         for key, value in preset.items():
             if hasattr(self.caption_config, key):
-                # Preserve user-specified values by not overwriting
-                pass
+                setattr(self.caption_config, key, value)
 
     def generate_captions(
         self,

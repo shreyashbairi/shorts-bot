@@ -165,7 +165,8 @@ def render_sidebar():
         "Caption Style",
         options=["Viral", "Bold", "Minimal", "Subtitle", "Karaoke"],
         index=0,
-        disabled=not enable_captions
+        disabled=not enable_captions,
+        help="Viral: Large, centered, word highlight\nBold: Large uppercase\nMinimal: Clean bottom captions\nSubtitle: Traditional with background\nKaraoke: Green highlight effect"
     )
     caption_style_map = {
         "Viral": CaptionStyle.VIRAL,
@@ -174,6 +175,75 @@ def render_sidebar():
         "Subtitle": CaptionStyle.SUBTITLE,
         "Karaoke": CaptionStyle.KARAOKE,
     }
+
+    # Caption customization expander
+    with st.sidebar.expander("Caption Customization", expanded=False):
+        caption_font = st.selectbox(
+            "Font",
+            options=["Arial-Bold", "Impact", "Helvetica-Bold", "Verdana-Bold", "Futura-Bold"],
+            index=0,
+            disabled=not enable_captions
+        )
+
+        caption_size = st.slider(
+            "Font Size",
+            min_value=32,
+            max_value=96,
+            value=60,
+            step=4,
+            disabled=not enable_captions
+        )
+
+        caption_position = st.selectbox(
+            "Position",
+            options=["center", "bottom", "top"],
+            index=0,
+            disabled=not enable_captions,
+            help="Where captions appear on video"
+        )
+
+        caption_uppercase = st.checkbox(
+            "Uppercase",
+            value=True,
+            disabled=not enable_captions
+        )
+
+        caption_highlight = st.checkbox(
+            "Highlight Current Word",
+            value=True,
+            disabled=not enable_captions,
+            help="Highlight the currently spoken word (viral effect)"
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            font_color = st.color_picker(
+                "Font Color",
+                value="#FFFFFF",
+                disabled=not enable_captions
+            )
+        with col2:
+            highlight_color = st.color_picker(
+                "Highlight Color",
+                value="#FFFF00",
+                disabled=not enable_captions
+            )
+
+        stroke_width = st.slider(
+            "Outline Width",
+            min_value=0,
+            max_value=8,
+            value=3,
+            disabled=not enable_captions
+        )
+
+        max_words = st.slider(
+            "Max Words Per Line",
+            min_value=2,
+            max_value=8,
+            value=4,
+            disabled=not enable_captions
+        )
 
     st.sidebar.markdown("---")
 
@@ -234,6 +304,16 @@ def render_sidebar():
     # Caption settings
     if enable_captions:
         config.caption.style = caption_style_map[caption_style]
+        # Apply customizations (these override style preset defaults)
+        config.caption.font_name = caption_font
+        config.caption.font_size = caption_size
+        config.caption.position = caption_position
+        config.caption.uppercase = caption_uppercase
+        config.caption.highlight_current_word = caption_highlight
+        config.caption.font_color = font_color
+        config.caption.highlight_color = highlight_color
+        config.caption.stroke_width = stroke_width
+        config.caption.max_words_per_line = max_words
 
     if language:
         config.transcription.language = language
@@ -247,7 +327,7 @@ def render_sidebar():
         # Apple M2 optimizations
         config.highlight.llm_n_gpu_layers = -1  # All layers on Metal
         config.highlight.llm_n_threads = 6  # Good for M2
-        config.highlight.llm_n_ctx = 2048
+        config.highlight.llm_n_ctx = 8192  # Full context for transcript analysis
     else:
         config.highlight.use_llm = False
 
