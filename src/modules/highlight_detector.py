@@ -712,8 +712,8 @@ class HighlightDetector:
                     model_name = self.hl_config.llm_model.replace(":", "-")
                     possible_paths = [
                         models_dir / f"{model_name}.gguf",
-                        models_dir / "llama-3.1-8b-instruct-q4_K_M.gguf",
-                        models_dir / "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+                        models_dir / "Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf",
+                        models_dir / "Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf",
                         Path.home() / ".cache" / "llama.cpp" / f"{model_name}.gguf",
                     ]
                     for p in possible_paths:
@@ -844,7 +844,7 @@ You are a video content analyst. Analyze video clips and rate their viral potent
 
             # Get model name (convert llama_cpp format to ollama format if needed)
             model_name = self.hl_config.llm_model
-            if "q4_K_M" in model_name.lower():
+            if "q5_K_M" in model_name.lower():
                 model_name = "llama3.1:8b"  # Ollama naming
 
             # Call ollama

@@ -196,7 +196,7 @@ class HighlightConfig:
 
     # Content analysis with LLM
     use_llm: bool = False  # Use local LLM for better analysis
-    llm_model: str = "llama3.1:8b-instruct-q4_K_M"  # Model name/path
+    llm_model: str = "Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf"  # Model name/path
     llm_backend: str = "llama_cpp"  # llama_cpp, ollama
     llm_model_path: Optional[str] = None  # Path to GGUF file (for llama_cpp)
     llm_n_ctx: int = 2048  # Context window size
