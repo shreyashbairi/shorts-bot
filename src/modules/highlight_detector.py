@@ -730,14 +730,17 @@ class HighlightDetector:
                 logger.info(f"Using Metal acceleration: n_gpu_layers={self.hl_config.llm_n_gpu_layers}")
 
                 # Initialize with Apple M2 optimizations
+                # Note: bf16 kernel warnings are normal on M2 - it falls back to f16
+                # Note: n_ctx < n_ctx_train warning is expected - we don't need full context
                 self._llm = Llama(
                     model_path=model_path,
                     n_ctx=self.hl_config.llm_n_ctx,
                     n_threads=self.hl_config.llm_n_threads,
                     n_gpu_layers=self.hl_config.llm_n_gpu_layers,  # -1 = all on Metal
-                    verbose=False,
+                    verbose=False,  # Suppress Metal kernel warnings
                     use_mmap=True,  # Memory-mapped for efficiency
                     use_mlock=False,  # Don't lock memory on macOS
+                    chat_format="llama-3",  # Use proper chat format to avoid duplicate tokens
                 )
 
                 logger.info("LLM initialized successfully with Metal acceleration")
@@ -790,26 +793,25 @@ class HighlightDetector:
         try:
             prompt = self._create_llm_prompt(highlights, transcript)
 
-            # Format for Llama 3.1 Instruct
-            formatted_prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-
-You are a video content analyst. Analyze video clips and rate their viral potential. Be concise and respond only with scores.<|eot_id|><|start_header_id|>user<|end_header_id|>
-
-{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-
-"""
-
             logger.debug("Running LLM inference with Metal acceleration")
 
-            response = llm(
-                formatted_prompt,
+            # Use chat completion API - handles tokenization properly
+            response = llm.create_chat_completion(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a video content analyst. Analyze video clips and rate their viral potential. Be concise and respond only with scores in the format: 1:8, 2:6, 3:9"
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
                 max_tokens=self.hl_config.llm_max_tokens,
                 temperature=self.hl_config.llm_temperature,
-                stop=["<|eot_id|>", "<|end_of_text|>"],
-                echo=False,
             )
 
-            response_text = response['choices'][0]['text'].strip()
+            response_text = response['choices'][0]['message']['content'].strip()
             logger.debug(f"LLM response: {response_text}")
 
             highlights = self._parse_llm_response(highlights, response_text)
