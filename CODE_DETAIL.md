@@ -121,8 +121,8 @@ shorts-bot/
    └──────┬──────┘
           ▼
    ┌─────────────────────────────────────────┐
-   │         InputHandler.process_file()      │
-   │  - Validate file exists                  │
+   │         InputHandler.process_file()     │
+   │  - Validate file exists                 │
    │  - Determine media type (video/audio)   │
    │  - Extract video metadata via FFprobe   │
    │  - Extract audio to WAV (16kHz mono)    │
@@ -136,7 +136,7 @@ shorts-bot/
 
 2. TRANSCRIPTION STAGE
    ┌─────────────────────────────────────────┐
-   │        Transcriber.transcribe()          │
+   │        Transcriber.transcribe()         │
    │  - Load Whisper model (lazy loading)    │
    │  - Process audio file                   │
    │  - Extract word-level timestamps        │
@@ -152,7 +152,7 @@ shorts-bot/
 
 3. HIGHLIGHT DETECTION STAGE
    ┌─────────────────────────────────────────┐
-   │   HighlightDetector.detect_highlights()  │
+   │   HighlightDetector.detect_highlights() │
    │  - Score each segment for:              │
    │    * Emotional content (0-1)            │
    │    * Key insights (0-1)                 │
