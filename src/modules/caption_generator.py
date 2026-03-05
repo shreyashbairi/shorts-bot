@@ -137,14 +137,23 @@ class CaptionGenerator:
         self._apply_style_preset()
 
     def _apply_style_preset(self):
-        """Apply style preset defaults to caption config."""
+        """Apply style preset defaults to caption config, preserving user overrides."""
         preset = self.STYLE_PRESETS.get(self.caption_config.style, {})
 
-        # Apply preset values to caption config
-        # This ensures each style looks visually distinct
-        for key, value in preset.items():
-            if hasattr(self.caption_config, key):
-                setattr(self.caption_config, key, value)
+        # Only apply preset values that haven't been customized by the user.
+        # We detect customization by comparing against CaptionConfig defaults.
+        from ..core.config import CaptionConfig
+        defaults = CaptionConfig()
+
+        for key, preset_value in preset.items():
+            if not hasattr(self.caption_config, key):
+                continue
+            current_value = getattr(self.caption_config, key)
+            default_value = getattr(defaults, key, None)
+            # Only apply preset if the current value matches the default
+            # (meaning the user hasn't explicitly changed it)
+            if current_value == default_value:
+                setattr(self.caption_config, key, preset_value)
 
     def generate_captions(
         self,
@@ -583,25 +592,120 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         self,
         captions: CaptionSequence
     ) -> CaptionSequence:
-        """Add emoji emphasis to captions based on content."""
+        """Add emoji emphasis to captions using LLM when available, else rule-based."""
         if not self.caption_config.add_emoji:
             return captions
 
+        # Try LLM-powered emoji placement
+        llm_result = self._add_emoji_with_llm(captions)
+        if llm_result is not None:
+            return llm_result
+
+        # Fallback: rule-based emoji placement
+        return self._add_emoji_rules(captions)
+
+    def _add_emoji_with_llm(self, captions: CaptionSequence) -> Optional[CaptionSequence]:
+        """Use LLM for context-aware emoji placement."""
+        try:
+            from ..core.config import HighlightConfig
+            # Access the LLM via highlight detector's init pattern
+            if not self.config.highlight.use_llm:
+                return None
+
+            if self.config.highlight.llm_backend == "llama_cpp":
+                from llama_cpp import Llama
+            else:
+                return None
+
+            # Check if LLM is available (reuse cached instance if possible)
+            if not hasattr(self, '_llm') or self._llm is None:
+                model_path = self.config.highlight.llm_model_path
+                if not model_path or not Path(model_path).exists():
+                    return None
+
+                self._llm = Llama(
+                    model_path=model_path,
+                    n_ctx=2048,
+                    n_threads=self.config.highlight.llm_n_threads,
+                    n_gpu_layers=self.config.highlight.llm_n_gpu_layers,
+                    verbose=False,
+                    use_mmap=True,
+                    use_mlock=False,
+                    chat_format="llama-3",
+                )
+
+            # Build caption text for LLM
+            lines_text = []
+            for i, line in enumerate(captions.lines):
+                lines_text.append(f"{i+1}. {line.text}")
+
+            prompt = f"""Add ONE relevant emoji to the end of each caption line. Pick emojis that match the emotional tone and content.
+
+CAPTION LINES:
+{chr(10).join(lines_text)}
+
+Rules:
+- Add exactly one emoji per line at the end
+- Match the emotion/topic (not random)
+- Use popular emojis viewers expect on social media
+- If a line is neutral/boring, skip it (return unchanged)
+
+OUTPUT FORMAT (JSON array of strings, same order):
+["line 1 text 🔥", "line 2 text", "line 3 text 😂"]
+
+Return ONLY the JSON array."""
+
+            response = self._llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": "You add contextually appropriate emojis to video captions for social media. Be selective - only add emojis where they enhance the message."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=1024,
+                temperature=0.5,
+            )
+
+            response_text = response['choices'][0]['message']['content'].strip()
+            json_match = re.search(r'\[[\s\S]*\]', response_text)
+            if not json_match:
+                return None
+
+            emoji_lines = json.loads(json_match.group())
+
+            new_lines = []
+            for i, line in enumerate(captions.lines):
+                text = emoji_lines[i] if i < len(emoji_lines) else line.text
+                new_lines.append(CaptionLine(
+                    text=text,
+                    start=line.start,
+                    end=line.end,
+                    words=line.words
+                ))
+
+            logger.info("Applied LLM-powered emoji emphasis")
+            return CaptionSequence(
+                lines=new_lines,
+                style=captions.style,
+                duration=captions.duration
+            )
+
+        except ImportError:
+            return None
+        except Exception as e:
+            logger.debug(f"LLM emoji placement failed: {e}")
+            return None
+
+    def _add_emoji_rules(self, captions: CaptionSequence) -> CaptionSequence:
+        """Fallback rule-based emoji placement."""
         emoji_map = {
-            # Emotions
             r'\b(love|amazing|incredible|awesome)\b': ' ❤️',
             r'\b(laugh|funny|hilarious|lol)\b': ' 😂',
             r'\b(wow|woah|whoa|omg)\b': ' 😮',
             r'\b(angry|mad|furious)\b': ' 😠',
             r'\b(sad|crying|tears)\b': ' 😢',
-
-            # Actions
             r'\b(money|cash|rich|dollar)\b': ' 💰',
             r'\b(fire|hot|lit|🔥)\b': ' 🔥',
             r'\b(think|thought|brain)\b': ' 🧠',
             r'\b(point|key|important)\b': ' 👉',
-
-            # Emphasis
             r'!{2,}': ' ‼️',
             r'\?{2,}': ' ❓',
         }
@@ -612,7 +716,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             for pattern, emoji in emoji_map.items():
                 if re.search(pattern, text, re.IGNORECASE):
                     text = re.sub(pattern, lambda m: m.group() + emoji, text, flags=re.IGNORECASE)
-                    break  # Only add one emoji per line
+                    break
 
             new_lines.append(CaptionLine(
                 text=text,

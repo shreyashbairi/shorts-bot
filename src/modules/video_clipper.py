@@ -162,12 +162,15 @@ class VideoClipper:
         output_name: str,
         clip_index: int
     ) -> Path:
-        """Create a single video clip."""
+        """Create a single video clip with smooth boundaries."""
         output_path = self.output_dir / f"{output_name}.{self.clip_config.output_format}"
 
-        # Calculate clip timing with padding
+        # Calculate clip timing with padding for natural transitions
+        # Use longer padding at end to avoid abrupt cut-offs
         start_time = max(0, highlight.start - self.clip_config.clip_padding_start)
-        end_time = min(video_info.duration, highlight.end + self.clip_config.clip_padding_end)
+        end_padding = self.clip_config.clip_padding_end
+        # Add extra end padding to let the last sentence complete naturally
+        end_time = min(video_info.duration, highlight.end + end_padding + 0.3)
         duration = end_time - start_time
 
         # Determine crop region
@@ -298,11 +301,11 @@ class VideoClipper:
         crop_region: CropRegion,
         video_info: VideoInfo
     ) -> List[str]:
-        """Build FFmpeg command for clip creation."""
+        """Build FFmpeg command for clip creation with smooth transitions."""
         target_width = self.platform.width
         target_height = self.platform.height
 
-        # Build filter graph
+        # Build video filter graph
         filters = []
 
         # 1. Crop to vertical aspect ratio
@@ -315,7 +318,15 @@ class VideoClipper:
         if video_info.fps != self.platform.fps:
             filters.append(f"fps={self.platform.fps}")
 
+        # 4. Add subtle fade-out at end to prevent jarring cut-off
+        fade_duration = min(0.5, duration * 0.05)  # 0.5s or 5% of clip
+        fade_start = max(0, duration - fade_duration)
+        filters.append(f"fade=t=out:st={fade_start:.2f}:d={fade_duration:.2f}")
+
         filter_string = ','.join(filters)
+
+        # Build audio filter for smooth audio fade-out
+        audio_filters = f"afade=t=out:st={fade_start:.2f}:d={fade_duration:.2f}"
 
         cmd = [
             'ffmpeg',
@@ -324,6 +335,7 @@ class VideoClipper:
             '-i', str(source_path),
             '-t', str(duration),
             '-vf', filter_string,
+            '-af', audio_filters,
             '-c:v', self.clip_config.codec,
             '-preset', self.clip_config.preset,
             '-crf', str(self.clip_config.crf),
@@ -382,18 +394,42 @@ class VideoClipper:
         time_ranges: List[Tuple[float, float]],
         video_info: VideoInfo
     ) -> List[Dict]:
-        """Detect faces using OpenCV."""
+        """Detect faces using OpenCV with DNN-based detector and temporal smoothing."""
         import cv2
 
-        # Load face detector
-        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        face_cascade = cv2.CascadeClassifier(cascade_path)
+        # Try DNN-based face detector first (much more accurate than Haar)
+        use_dnn = False
+        net = None
+        try:
+            # OpenCV ships with a pre-trained Caffe face detection model
+            model_file = cv2.data.haarcascades + '../../../share/opencv4/dnn/opencv_face_detector_uint8.pb'
+            config_file = cv2.data.haarcascades + '../../../share/opencv4/dnn/opencv_face_detector.pbtxt'
+            from pathlib import Path as _P
+            if _P(model_file).exists() and _P(config_file).exists():
+                net = cv2.dnn.readNetFromTensorflow(model_file, config_file)
+                use_dnn = True
+                logger.debug("Using DNN-based face detector")
+        except Exception:
+            pass
+
+        # Fall back to Haar cascade if DNN not available
+        face_cascade = None
+        if not use_dnn:
+            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            face_cascade = cv2.CascadeClassifier(cascade_path)
+            # Also try profile face for side views
+            profile_cascade_path = cv2.data.haarcascades + 'haarcascade_profileface.xml'
+            profile_cascade = cv2.CascadeClassifier(profile_cascade_path)
+            logger.debug("Using Haar cascade face detector")
 
         cap = cv2.VideoCapture(str(video_path))
-        faces = []
+        if not cap.isOpened():
+            logger.warning(f"Could not open video: {video_path}")
+            return []
 
-        fps = video_info.fps
-        sample_interval = 1.0  # Sample every second
+        faces = []
+        fps = video_info.fps if video_info.fps > 0 else 30.0
+        sample_interval = 0.5  # Sample every 0.5 seconds for smoother tracking
 
         for start_time, end_time in time_ranges:
             current_time = start_time
@@ -404,35 +440,120 @@ class VideoClipper:
 
                 ret, frame = cap.read()
                 if not ret:
-                    break
+                    current_time += sample_interval
+                    continue
 
-                # Convert to grayscale for detection
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                frame_h, frame_w = frame.shape[:2]
+                detected_faces = []
 
-                # Detect faces
-                detected = face_cascade.detectMultiScale(
-                    gray,
-                    scaleFactor=1.1,
-                    minNeighbors=5,
-                    minSize=(50, 50)
-                )
+                if use_dnn and net is not None:
+                    # DNN-based detection
+                    blob = cv2.dnn.blobFromImage(
+                        frame, 1.0, (300, 300),
+                        [104, 117, 123], False, False
+                    )
+                    net.setInput(blob)
+                    detections = net.forward()
 
-                for (x, y, w, h) in detected:
-                    faces.append({
-                        'x': x + w // 2,  # Center X
-                        'y': y + h // 2,  # Center Y
-                        'width': w,
-                        'height': h,
-                        'timestamp': current_time,
-                        'confidence': 1.0
-                    })
+                    for i in range(detections.shape[2]):
+                        confidence = detections[0, 0, i, 2]
+                        if confidence > self.clip_config.face_detection_confidence:
+                            x1 = int(detections[0, 0, i, 3] * frame_w)
+                            y1 = int(detections[0, 0, i, 4] * frame_h)
+                            x2 = int(detections[0, 0, i, 5] * frame_w)
+                            y2 = int(detections[0, 0, i, 6] * frame_h)
+                            w = x2 - x1
+                            h = y2 - y1
+                            if w > 30 and h > 30:
+                                detected_faces.append({
+                                    'x': x1 + w // 2,
+                                    'y': y1 + h // 2,
+                                    'width': w,
+                                    'height': h,
+                                    'confidence': float(confidence),
+                                })
+                else:
+                    # Haar cascade detection
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    # Equalize histogram for better detection in varying lighting
+                    gray = cv2.equalizeHist(gray)
+
+                    detected = face_cascade.detectMultiScale(
+                        gray,
+                        scaleFactor=1.1,
+                        minNeighbors=4,
+                        minSize=(int(frame_w * 0.05), int(frame_h * 0.05)),
+                        flags=cv2.CASCADE_SCALE_IMAGE
+                    )
+
+                    for (x, y, w, h) in detected:
+                        detected_faces.append({
+                            'x': x + w // 2,
+                            'y': y + h // 2,
+                            'width': w,
+                            'height': h,
+                            'confidence': 0.8,
+                        })
+
+                    # Also check for profile faces if no frontal faces found
+                    if len(detected_faces) == 0 and profile_cascade is not None:
+                        profiles = profile_cascade.detectMultiScale(
+                            gray,
+                            scaleFactor=1.1,
+                            minNeighbors=4,
+                            minSize=(int(frame_w * 0.05), int(frame_h * 0.05))
+                        )
+                        for (x, y, w, h) in profiles:
+                            detected_faces.append({
+                                'x': x + w // 2,
+                                'y': y + h // 2,
+                                'width': w,
+                                'height': h,
+                                'confidence': 0.6,
+                            })
+
+                # Pick the largest/most confident face if multiple detected
+                if detected_faces:
+                    # Sort by confidence * area (prefer large, confident detections)
+                    detected_faces.sort(
+                        key=lambda f: f['confidence'] * f['width'] * f['height'],
+                        reverse=True
+                    )
+                    best = detected_faces[0]
+                    best['timestamp'] = current_time
+                    faces.append(best)
 
                 current_time += sample_interval
 
         cap.release()
 
-        logger.debug(f"Detected {len(faces)} face instances")
+        # Apply temporal smoothing to face positions
+        faces = self._smooth_face_positions(faces)
+
+        logger.debug(f"Detected {len(faces)} face instances across {len(time_ranges)} time ranges")
         return faces
+
+    def _smooth_face_positions(self, faces: List[Dict]) -> List[Dict]:
+        """Apply exponential moving average to smooth face tracking positions."""
+        if len(faces) < 2:
+            return faces
+
+        smoothness = self.clip_config.tracking_smoothness
+        alpha = 1.0 - smoothness  # Higher smoothness = lower alpha = more smoothing
+
+        smoothed = [faces[0].copy()]
+        for i in range(1, len(faces)):
+            current = faces[i].copy()
+            prev = smoothed[-1]
+
+            # Only smooth if timestamps are close (within same time range)
+            if current['timestamp'] - prev['timestamp'] < 3.0:
+                current['x'] = int(alpha * current['x'] + (1 - alpha) * prev['x'])
+                current['y'] = int(alpha * current['y'] + (1 - alpha) * prev['y'])
+
+            smoothed.append(current)
+
+        return smoothed
 
     def _merge_time_ranges(
         self,
@@ -567,7 +688,9 @@ class VideoClipper:
     def concatenate_clips(
         self,
         clip_paths: List[Path],
-        output_prefix: str = "combined"
+        output_prefix: str = "combined",
+        transition: Optional[str] = None,
+        transition_duration: float = 0.5
     ) -> Path:
         """
         Concatenate multiple video clips into a single video.
@@ -575,6 +698,8 @@ class VideoClipper:
         Args:
             clip_paths: List of video file paths to concatenate
             output_prefix: Prefix for output filename
+            transition: Transition effect ('crossfade', 'fade_black', 'wipe', None)
+            transition_duration: Duration of transition in seconds
 
         Returns:
             Path to concatenated video
@@ -587,36 +712,34 @@ class VideoClipper:
 
         output_path = self.output_dir / f"{output_prefix}.{self.clip_config.output_format}"
 
-        # Create a temporary file list for FFmpeg concat demuxer
+        # Use transition-based concatenation if requested
+        if transition and transition in ('crossfade', 'fade_black', 'wipe'):
+            return self._concatenate_with_transition(
+                clip_paths, output_path, transition, transition_duration
+            )
+
+        # Simple concatenation
         concat_file = self.temp_dir / "concat_list.txt"
 
         with open(concat_file, 'w') as f:
             for clip_path in clip_paths:
-                # Escape single quotes and write file path
                 escaped_path = str(clip_path).replace("'", "'\\''")
                 f.write(f"file '{escaped_path}'\n")
 
         logger.info(f"Concatenating {len(clip_paths)} clips into {output_path.name}")
 
-        # Use FFmpeg concat demuxer
         cmd = [
             'ffmpeg', '-y',
             '-f', 'concat',
             '-safe', '0',
             '-i', str(concat_file),
-            '-c', 'copy',  # Copy streams without re-encoding
+            '-c', 'copy',
             str(output_path)
         ]
 
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-        except subprocess.CalledProcessError as e:
-            # If copy fails (different codecs), try re-encoding
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError:
             logger.warning("Direct copy failed, re-encoding clips")
             cmd = [
                 'ffmpeg', '-y',
@@ -632,13 +755,117 @@ class VideoClipper:
             ]
             subprocess.run(cmd, capture_output=True, text=True, check=True)
 
-        # Clean up concat file
         try:
             concat_file.unlink()
-        except:
+        except Exception:
             pass
 
         logger.info(f"Created concatenated video: {output_path.name}")
+        return output_path
+
+    def _concatenate_with_transition(
+        self,
+        clip_paths: List[Path],
+        output_path: Path,
+        transition: str,
+        transition_duration: float
+    ) -> Path:
+        """Concatenate clips with transition effects using FFmpeg xfade filter."""
+        logger.info(f"Concatenating {len(clip_paths)} clips with {transition} transition")
+
+        # Get durations of all clips
+        durations = []
+        for path in clip_paths:
+            info = get_video_info(path)
+            durations.append(info.duration)
+
+        # Build FFmpeg filter graph for xfade transitions
+        n = len(clip_paths)
+
+        # Build input args
+        input_args = []
+        for path in clip_paths:
+            input_args.extend(['-i', str(path)])
+
+        if transition == 'crossfade':
+            xfade_transition = 'fade'
+        elif transition == 'fade_black':
+            xfade_transition = 'fadeblack'
+        elif transition == 'wipe':
+            xfade_transition = 'wipeleft'
+        else:
+            xfade_transition = 'fade'
+
+        # Chain xfade filters for video
+        video_filters = []
+        audio_filters = []
+        td = transition_duration
+
+        # Calculate offset for each transition
+        # offset_i = sum of durations[0..i] - i * transition_duration
+        offsets = []
+        cumulative = 0.0
+        for i in range(n - 1):
+            cumulative += durations[i]
+            offset = cumulative - (i + 1) * td
+            offsets.append(max(0, offset))
+
+        if n == 2:
+            video_filters.append(
+                f"[0:v][1:v]xfade=transition={xfade_transition}:duration={td}:offset={offsets[0]:.3f}[vout]"
+            )
+            audio_filters.append(
+                f"[0:a][1:a]acrossfade=d={td}[aout]"
+            )
+            map_v = "[vout]"
+            map_a = "[aout]"
+        else:
+            # Chain multiple xfade filters
+            prev_label = "0:v"
+            for i in range(n - 1):
+                next_input = f"{i+1}:v"
+                out_label = f"v{i}" if i < n - 2 else "vout"
+                video_filters.append(
+                    f"[{prev_label}][{next_input}]xfade=transition={xfade_transition}:duration={td}:offset={offsets[i]:.3f}[{out_label}]"
+                )
+                prev_label = out_label
+
+            prev_label_a = "0:a"
+            for i in range(n - 1):
+                next_input_a = f"{i+1}:a"
+                out_label_a = f"a{i}" if i < n - 2 else "aout"
+                audio_filters.append(
+                    f"[{prev_label_a}][{next_input_a}]acrossfade=d={td}[{out_label_a}]"
+                )
+                prev_label_a = out_label_a
+
+            map_v = "[vout]"
+            map_a = "[aout]"
+
+        filter_complex = ";".join(video_filters + audio_filters)
+
+        cmd = [
+            'ffmpeg', '-y',
+            *input_args,
+            '-filter_complex', filter_complex,
+            '-map', map_v,
+            '-map', map_a,
+            '-c:v', self.clip_config.codec,
+            '-preset', self.clip_config.preset,
+            '-crf', str(self.clip_config.crf),
+            '-c:a', self.clip_config.audio_codec,
+            '-b:a', self.platform.audio_bitrate,
+            str(output_path)
+        ]
+
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Transition concatenation failed: {e.stderr}, falling back to simple concat")
+            # Fall back to simple concat
+            return self.concatenate_clips(clip_paths, output_path.stem, transition=None)
+
+        logger.info(f"Created video with {transition} transitions: {output_path.name}")
         return output_path
 
     def cleanup(self):

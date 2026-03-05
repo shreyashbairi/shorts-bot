@@ -663,6 +663,235 @@ class Pipeline:
 
         return final_clip
 
+    def process_multi_video(
+        self,
+        file_paths: List[Path],
+        stitch_mode: str = "best_highlights",
+        target_duration: Optional[float] = None,
+        transition: Optional[str] = None,
+        transition_duration: float = 0.5,
+        add_captions: bool = True,
+        output_name: Optional[str] = None,
+    ) -> ProcessingResult:
+        """
+        Process multiple videos and stitch their best highlights into one clip.
+
+        Args:
+            file_paths: List of source video paths
+            stitch_mode: 'best_highlights' (pick best across all), 'one_per_video' (one from each)
+            target_duration: Target total duration (optional)
+            transition: Transition between clips ('crossfade', 'fade_black', 'wipe', None)
+            transition_duration: Transition duration in seconds
+            add_captions: Whether to add captions
+            output_name: Custom output name
+
+        Returns:
+            ProcessingResult with stitched output
+        """
+        start_time = time.time()
+
+        if output_name is None:
+            output_name = "multi_video_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        video_output_dir = ensure_dir(self.config.output_dir / output_name)
+
+        result = ProcessingResult(
+            input_file=InputFile(
+                path=file_paths[0],
+                media_type=MediaType.UNKNOWN,
+                video_info=None
+            ),
+            output_dir=video_output_dir
+        )
+
+        try:
+            self._update_progress(PipelineStage.INPUT, 0.0, f"Processing {len(file_paths)} videos")
+
+            # Step 1: Transcribe all videos and detect highlights
+            all_highlights_with_source = []  # (highlight, source_path, transcript)
+
+            for i, file_path in enumerate(file_paths):
+                file_path = Path(file_path)
+                self._update_progress(
+                    PipelineStage.TRANSCRIPTION,
+                    i / len(file_paths),
+                    f"Transcribing video {i+1}/{len(file_paths)}: {file_path.name}"
+                )
+
+                input_file = self.input_handler.process_file(file_path)
+                if input_file.audio_path is None:
+                    logger.warning(f"Skipping {file_path.name}: no audio")
+                    continue
+
+                transcript = self.transcriber.transcribe_with_cache(input_file.audio_path)
+
+                self._update_progress(
+                    PipelineStage.HIGHLIGHT_DETECTION,
+                    i / len(file_paths),
+                    f"Detecting highlights in video {i+1}/{len(file_paths)}"
+                )
+
+                highlights = self.highlight_detector.detect_highlights(
+                    transcript, audio_path=input_file.audio_path
+                )
+
+                for h in highlights.highlights:
+                    all_highlights_with_source.append((h, file_path, transcript))
+
+            if not all_highlights_with_source:
+                raise RuntimeError("No highlights found across any videos")
+
+            # Step 2: Select highlights based on stitch mode
+            if stitch_mode == "one_per_video":
+                # Pick the best highlight from each video
+                best_per_video = {}
+                for h, source, transcript in all_highlights_with_source:
+                    if source not in best_per_video or h.score > best_per_video[source][0].score:
+                        best_per_video[source] = (h, source, transcript)
+                selected = list(best_per_video.values())
+            else:
+                # Sort all highlights by score, pick top N
+                all_highlights_with_source.sort(key=lambda x: x[0].score, reverse=True)
+                selected = all_highlights_with_source[:self.config.highlight.target_clips]
+
+            # If target duration specified, trim selection
+            if target_duration:
+                trimmed = []
+                cumulative = 0.0
+                for h, source, transcript in selected:
+                    if cumulative + h.duration > target_duration * 1.2:
+                        break
+                    trimmed.append((h, source, transcript))
+                    cumulative += h.duration
+                selected = trimmed if trimmed else selected[:1]
+
+            self._update_progress(
+                PipelineStage.CLIPPING, 0.0,
+                f"Creating {len(selected)} clips from {len(file_paths)} videos"
+            )
+
+            # Step 3: Create individual clips
+            clip_paths = []
+            clip_results = []
+            transcripts_by_clip = []
+
+            for i, (h, source, transcript) in enumerate(selected):
+                self._update_progress(
+                    PipelineStage.CLIPPING,
+                    i / len(selected),
+                    f"Clipping segment {i+1}/{len(selected)} from {source.name}"
+                )
+
+                clips = self.video_clipper.create_clips(
+                    source_path=source,
+                    highlights=[h],
+                    output_prefix=f"{output_name}_seg{i+1:02d}"
+                )
+
+                if clips:
+                    clip_paths.append(clips[0].path)
+                    clip_results.append(clips[0])
+                    transcripts_by_clip.append((h, transcript))
+
+            if not clip_paths:
+                raise RuntimeError("Failed to create any clips")
+
+            # Step 4: Add captions to individual clips before stitching
+            if add_captions:
+                self._update_progress(PipelineStage.CAPTIONING, 0.0, "Adding captions")
+
+                captioned_paths = []
+                for i, (clip_res, (h, transcript)) in enumerate(zip(clip_results, transcripts_by_clip)):
+                    self._update_progress(
+                        PipelineStage.CAPTIONING,
+                        i / len(clip_results),
+                        f"Captioning clip {i+1}/{len(clip_results)}"
+                    )
+
+                    clip_captions = self.caption_generator.generate_captions(
+                        transcript=transcript,
+                        clip_start=h.start,
+                        clip_end=h.end
+                    )
+
+                    if self.config.caption.add_emoji:
+                        clip_captions = self.caption_generator.add_emoji_emphasis(clip_captions)
+
+                    captioned_path = self.caption_generator.burn_captions(
+                        video_path=clip_res.path,
+                        captions=clip_captions,
+                        output_path=video_output_dir / f"{clip_res.path.stem}_captioned.mp4"
+                    )
+                    captioned_paths.append(captioned_path)
+
+                clip_paths = captioned_paths
+
+            # Step 5: Stitch clips together with transitions
+            self._update_progress(PipelineStage.EXPORT, 0.0, "Stitching clips together")
+
+            if len(clip_paths) > 1:
+                final_path = self.video_clipper.concatenate_clips(
+                    clip_paths=clip_paths,
+                    output_prefix=output_name,
+                    transition=transition,
+                    transition_duration=transition_duration
+                )
+            else:
+                final_path = clip_paths[0]
+
+            # Build combined highlight for the result
+            total_duration = sum(h.duration for h, _, _ in selected)
+            combined_highlight = Highlight(
+                start=0,
+                end=total_duration,
+                text=f"Combined highlights from {len(file_paths)} videos",
+                score=sum(h.score for h, _, _ in selected) / len(selected),
+                reasons=[],
+                metadata={
+                    'source_videos': [str(p) for p in file_paths],
+                    'stitch_mode': stitch_mode,
+                    'transition': transition,
+                    'segment_count': len(selected)
+                }
+            )
+
+            from ..utils.video_utils import get_video_info
+            final_info = get_video_info(final_path)
+
+            final_clip = ClipResult(
+                path=final_path,
+                highlight=combined_highlight,
+                duration=final_info.duration,
+                width=final_info.width,
+                height=final_info.height,
+                file_size=final_path.stat().st_size if final_path.exists() else 0,
+                metadata={'multi_video': True, 'source_count': len(file_paths)}
+            )
+
+            result.clips = [final_clip]
+            result.success = True
+            result.processing_time = time.time() - start_time
+            result.metadata = {
+                'processed_at': datetime.now().isoformat(),
+                'mode': 'multi_video',
+                'source_count': len(file_paths),
+                'stitch_mode': stitch_mode,
+            }
+
+            self._update_progress(
+                PipelineStage.COMPLETE, 1.0,
+                f"Multi-video processing complete in {result.processing_time:.1f}s"
+            )
+
+        except Exception as e:
+            logger.error(f"Multi-video pipeline error: {e}", exc_info=True)
+            result.success = False
+            result.error = str(e)
+            result.processing_time = time.time() - start_time
+
+        result.save(video_output_dir / f"{output_name}_result.json")
+        return result
+
     def cleanup(self):
         """Clean up all temporary files."""
         logger.info("Cleaning up temporary files")

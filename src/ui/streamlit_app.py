@@ -388,6 +388,32 @@ def render_main_content():
 
         st.markdown("---")
 
+        # Target duration option
+        st.markdown("### Output Settings")
+        col1, col2 = st.columns(2)
+        with col1:
+            target_duration_enabled = st.checkbox(
+                "Specify target clip duration",
+                value=False,
+                help="Generate clips of approximately this length instead of auto-detecting"
+            )
+        with col2:
+            target_duration = st.number_input(
+                "Target Duration (seconds)",
+                min_value=10,
+                max_value=180,
+                value=45,
+                step=5,
+                disabled=not target_duration_enabled,
+                help="Each clip will be approximately this length"
+            )
+
+        if target_duration_enabled and config:
+            config.highlight.min_clip_duration = max(10, target_duration - 10)
+            config.highlight.max_clip_duration = target_duration + 10
+
+        st.markdown("---")
+
         # Process button
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
@@ -407,7 +433,7 @@ def render_main_content():
 
 
 def process_video(uploaded_file):
-    """Process the uploaded video."""
+    """Process the uploaded video with detailed progress tracking."""
     st.session_state.processing = True
     st.session_state.result = None
 
@@ -419,8 +445,28 @@ def process_video(uploaded_file):
     try:
         config = st.session_state.config
 
-        # Create progress container
+        # Create progress container with stage-based tracking
         progress_container = st.container()
+
+        # Stage weights for overall progress calculation
+        stage_weights = {
+            PipelineStage.INPUT: 0.05,
+            PipelineStage.TRANSCRIPTION: 0.30,
+            PipelineStage.HIGHLIGHT_DETECTION: 0.15,
+            PipelineStage.CLIPPING: 0.25,
+            PipelineStage.CAPTIONING: 0.20,
+            PipelineStage.EXPORT: 0.05,
+        }
+
+        stage_labels = {
+            PipelineStage.INPUT: "Preparing input...",
+            PipelineStage.TRANSCRIPTION: "Transcribing audio (this may take a while)...",
+            PipelineStage.HIGHLIGHT_DETECTION: "Finding interesting moments...",
+            PipelineStage.CLIPPING: "Creating video clips...",
+            PipelineStage.CAPTIONING: "Adding captions...",
+            PipelineStage.EXPORT: "Exporting final videos...",
+            PipelineStage.COMPLETE: "Done!",
+        }
 
         with progress_container:
             progress_bar = st.progress(0.0)
@@ -428,9 +474,23 @@ def process_video(uploaded_file):
             stage_text = st.empty()
 
         def update_progress(stage: PipelineStage, progress: float, message: str):
-            progress_bar.progress(progress)
+            # Calculate overall progress based on stage weights
+            stages = list(stage_weights.keys())
+            if stage in stages:
+                stage_idx = stages.index(stage)
+                completed_weight = sum(
+                    stage_weights[s] for s in stages[:stage_idx]
+                )
+                current_weight = stage_weights[stage]
+                overall = completed_weight + current_weight * progress
+            elif stage == PipelineStage.COMPLETE:
+                overall = 1.0
+            else:
+                overall = progress
+
+            progress_bar.progress(min(overall, 1.0))
             status_text.text(message)
-            stage_text.text(f"Stage: {stage.value}")
+            stage_text.text(stage_labels.get(stage, f"Stage: {stage.value}"))
 
         # Create pipeline and process
         pipeline = Pipeline(config, progress_callback=update_progress)
@@ -444,10 +504,16 @@ def process_video(uploaded_file):
             st.success(f"Processing complete! Generated {len(result.clips)} clips in {result.processing_time:.1f}s")
         else:
             st.error(f"Processing failed: {result.error}")
+            if result.error:
+                with st.expander("Error Details"):
+                    st.code(result.error)
 
     except Exception as e:
         st.error(f"Error: {str(e)}")
         logger.exception("Processing error")
+        with st.expander("Error Details"):
+            import traceback
+            st.code(traceback.format_exc())
 
     finally:
         st.session_state.processing = False
@@ -486,7 +552,13 @@ def render_results():
         st.markdown("### Generated Clips")
 
         for i, clip in enumerate(result.clips):
-            with st.expander(f"Clip {i + 1}: {clip.duration:.1f}s", expanded=(i == 0)):
+            # Build expander title with virality score if available
+            virality = clip.highlight.metadata.get('virality_score')
+            title_suffix = f" | Virality: {virality}/100" if virality else ""
+            suggested_title = clip.highlight.metadata.get('suggested_title', '')
+            clip_label = suggested_title or f"Clip {i + 1}"
+
+            with st.expander(f"{clip_label}: {clip.duration:.1f}s{title_suffix}", expanded=(i == 0)):
                 col1, col2 = st.columns([2, 1])
 
                 with col1:
@@ -505,6 +577,19 @@ def render_results():
                     st.write(f"Size: {clip.file_size // 1024} KB")
                     st.write(f"Score: {clip.highlight.score:.2f}")
 
+                    # Virality score with color coding
+                    if virality is not None:
+                        if virality >= 75:
+                            st.success(f"Virality Score: {virality}/100")
+                        elif virality >= 50:
+                            st.info(f"Virality Score: {virality}/100")
+                        else:
+                            st.warning(f"Virality Score: {virality}/100")
+
+                        explanation = clip.highlight.metadata.get('virality_explanation', '')
+                        if explanation:
+                            st.caption(explanation)
+
                     st.markdown("**Reasons**")
                     for reason in clip.highlight.reasons:
                         st.write(f"• {reason.value.replace('_', ' ').title()}")
@@ -518,6 +603,24 @@ def render_results():
                                 file_name=clip.path.name,
                                 mime="video/mp4"
                             )
+
+                # LLM-generated metadata (title, description, hashtags)
+                if any(clip.highlight.metadata.get(k) for k in ['suggested_title', 'suggested_description', 'suggested_hashtags', 'hook_text']):
+                    st.markdown("**AI-Generated Metadata**")
+                    meta_cols = st.columns(2)
+                    with meta_cols[0]:
+                        if suggested_title:
+                            st.text_input("Suggested Title", value=suggested_title, key=f"title_{i}", disabled=True)
+                        desc = clip.highlight.metadata.get('suggested_description', '')
+                        if desc:
+                            st.text_area("Description", value=desc, key=f"desc_{i}", height=68, disabled=True)
+                    with meta_cols[1]:
+                        hashtags = clip.highlight.metadata.get('suggested_hashtags', [])
+                        if hashtags:
+                            st.write("**Hashtags:** " + " ".join(f"#{t}" for t in hashtags))
+                        hook = clip.highlight.metadata.get('hook_text', '')
+                        if hook:
+                            st.write(f"**Hook Text:** {hook}")
 
     # Transcript preview
     if result.transcript:
@@ -869,6 +972,332 @@ def render_manual_clip_tab():
             """)
 
 
+def render_multi_video_tab():
+    """Render the multi-video processing tab."""
+    st.markdown("## Multi-Video Processing")
+    st.write("Upload multiple videos, find the best highlights across all of them, and stitch them into one clip.")
+
+    uploaded_files = st.file_uploader(
+        "Upload multiple videos",
+        type=['mp4', 'mkv', 'avi', 'mov', 'webm'],
+        accept_multiple_files=True,
+        key="multi_video_upload"
+    )
+
+    if uploaded_files and len(uploaded_files) >= 2:
+        st.info(f"{len(uploaded_files)} videos selected")
+
+        for i, f in enumerate(uploaded_files):
+            size_mb = f.size / (1024 * 1024)
+            st.write(f"**{i+1}.** {f.name} ({size_mb:.1f} MB)")
+
+        st.markdown("---")
+        st.markdown("### Processing Options")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            stitch_mode = st.selectbox(
+                "Highlight Selection Mode",
+                options=["Best Overall", "One Per Video"],
+                index=0,
+                help="Best Overall: Pick the best highlights across all videos\n"
+                     "One Per Video: Pick the best highlight from each video"
+            )
+            mode_map = {"Best Overall": "best_highlights", "One Per Video": "one_per_video"}
+
+        with col2:
+            target_dur_enabled = st.checkbox("Set target duration", value=False)
+            target_dur = st.number_input(
+                "Target Duration (s)",
+                min_value=15,
+                max_value=300,
+                value=60,
+                disabled=not target_dur_enabled
+            )
+
+        col3, col4 = st.columns(2)
+        with col3:
+            mv_transition = st.selectbox(
+                "Transition Between Clips",
+                options=["None", "Crossfade", "Fade to Black", "Wipe"],
+                index=1,
+                key="mv_transition"
+            )
+            mv_trans_map = {"None": None, "Crossfade": "crossfade", "Fade to Black": "fade_black", "Wipe": "wipe"}
+
+        with col4:
+            mv_trans_dur = st.slider(
+                "Transition Duration (s)",
+                min_value=0.2,
+                max_value=2.0,
+                value=0.5,
+                step=0.1,
+                disabled=(mv_transition == "None"),
+                key="mv_trans_dur"
+            )
+
+        mv_captions = st.checkbox("Add Captions", value=True, key="mv_captions")
+
+        st.markdown("---")
+
+        if st.button("🎬 Process & Stitch Videos", type="primary"):
+            # Save all uploaded files to temp
+            temp_paths = []
+            try:
+                for uf in uploaded_files:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uf.name).suffix) as tmp:
+                        tmp.write(uf.getvalue())
+                        temp_paths.append(Path(tmp.name))
+
+                config = st.session_state.config or Config()
+
+                # Progress tracking
+                progress_bar = st.progress(0.0)
+                status_text = st.empty()
+
+                def update_progress(stage, progress, message):
+                    stage_weights = {
+                        PipelineStage.INPUT: 0.05,
+                        PipelineStage.TRANSCRIPTION: 0.35,
+                        PipelineStage.HIGHLIGHT_DETECTION: 0.15,
+                        PipelineStage.CLIPPING: 0.20,
+                        PipelineStage.CAPTIONING: 0.15,
+                        PipelineStage.EXPORT: 0.10,
+                    }
+                    stages = list(stage_weights.keys())
+                    if stage in stages:
+                        idx = stages.index(stage)
+                        completed = sum(stage_weights[s] for s in stages[:idx])
+                        overall = completed + stage_weights[stage] * progress
+                    elif stage == PipelineStage.COMPLETE:
+                        overall = 1.0
+                    else:
+                        overall = progress
+                    progress_bar.progress(min(overall, 1.0))
+                    status_text.text(message)
+
+                pipeline = Pipeline(config, progress_callback=update_progress)
+
+                with st.spinner(f"Processing {len(temp_paths)} videos..."):
+                    result = pipeline.process_multi_video(
+                        file_paths=temp_paths,
+                        stitch_mode=mode_map[stitch_mode],
+                        target_duration=float(target_dur) if target_dur_enabled else None,
+                        transition=mv_trans_map[mv_transition],
+                        transition_duration=mv_trans_dur,
+                        add_captions=mv_captions,
+                    )
+
+                if result.success and result.clips:
+                    clip = result.clips[0]
+                    st.success(
+                        f"Multi-video processing complete! "
+                        f"Duration: {clip.duration:.1f}s | "
+                        f"Processing time: {result.processing_time:.1f}s"
+                    )
+
+                    if clip.path.exists():
+                        with open(clip.path, 'rb') as f:
+                            st.video(f.read())
+                        with open(clip.path, 'rb') as f:
+                            st.download_button(
+                                "⬇️ Download Stitched Video",
+                                f,
+                                file_name="multi_video_result.mp4",
+                                mime="video/mp4"
+                            )
+                else:
+                    st.error(f"Processing failed: {result.error}")
+
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
+                logger.exception("Multi-video processing error")
+            finally:
+                for p in temp_paths:
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+
+    elif uploaded_files and len(uploaded_files) < 2:
+        st.warning("Please upload at least 2 videos for multi-video processing. For a single video, use the 'Process Video' tab.")
+    else:
+        st.info("Upload 2 or more videos to get started. The app will find the best moments across all videos and combine them into one clip.")
+
+
+def render_stitch_clips_tab():
+    """Render the stitch clips tab for combining multiple generated clips."""
+    st.markdown("## Stitch Clips")
+    st.write("Combine multiple clips into one longer video. Upload clips or use previously generated ones.")
+
+    # Transition settings
+    st.markdown("### Transition Settings")
+    trans_col1, trans_col2 = st.columns(2)
+    with trans_col1:
+        transition_type = st.selectbox(
+            "Transition Effect",
+            options=["None", "Crossfade", "Fade to Black", "Wipe"],
+            index=0,
+            help="Effect applied between clips when stitching"
+        )
+    with trans_col2:
+        transition_duration = st.slider(
+            "Transition Duration (s)",
+            min_value=0.2,
+            max_value=2.0,
+            value=0.5,
+            step=0.1,
+            disabled=(transition_type == "None")
+        )
+
+    transition_map = {
+        "None": None,
+        "Crossfade": "crossfade",
+        "Fade to Black": "fade_black",
+        "Wipe": "wipe",
+    }
+    selected_transition = transition_map[transition_type]
+
+    st.markdown("---")
+
+    # Method selection
+    stitch_method = st.radio(
+        "Select clips to stitch",
+        options=["Upload clip files", "Use generated clips from last processing"],
+        horizontal=True
+    )
+
+    clip_paths = []
+
+    if stitch_method == "Upload clip files":
+        uploaded_clips = st.file_uploader(
+            "Upload video clips to combine",
+            type=['mp4', 'mkv', 'avi', 'mov', 'webm'],
+            accept_multiple_files=True,
+            key="stitch_upload"
+        )
+
+        if uploaded_clips:
+            st.info(f"{len(uploaded_clips)} clips selected")
+
+            # Show clip order
+            st.markdown("### Clip Order")
+            st.write("Clips will be combined in the order shown below. Drag to reorder (in future).")
+
+            for i, clip in enumerate(uploaded_clips):
+                st.write(f"**{i + 1}.** {clip.name} ({clip.size / 1024:.0f} KB)")
+
+            if st.button("🔗 Stitch Clips Together", type="primary"):
+                # Save uploaded clips to temp files
+                temp_paths = []
+                try:
+                    for clip in uploaded_clips:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
+                            tmp.write(clip.getvalue())
+                            temp_paths.append(Path(tmp.name))
+
+                    config = st.session_state.config or Config()
+                    from src.modules.video_clipper import VideoClipper
+                    clipper = VideoClipper(config)
+
+                    with st.spinner(f"Stitching {len(temp_paths)} clips together..."):
+                        output_path = clipper.concatenate_clips(
+                            clip_paths=temp_paths,
+                            output_prefix="stitched_clip",
+                            transition=selected_transition,
+                            transition_duration=transition_duration
+                        )
+
+                    if output_path.exists():
+                        st.success(f"Clips stitched successfully!")
+                        with open(output_path, 'rb') as f:
+                            video_bytes = f.read()
+                        st.video(video_bytes)
+                        with open(output_path, 'rb') as f:
+                            st.download_button(
+                                "⬇️ Download Stitched Video",
+                                f,
+                                file_name="stitched_video.mp4",
+                                mime="video/mp4"
+                            )
+                    else:
+                        st.error("Failed to create stitched video")
+
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+                    logger.exception("Stitch error")
+                finally:
+                    for p in temp_paths:
+                        try:
+                            p.unlink()
+                        except:
+                            pass
+
+    else:
+        # Use generated clips from last processing
+        result = st.session_state.result
+        if result and result.clips:
+            st.success(f"{len(result.clips)} clips available from last processing")
+
+            # Let user select which clips to include and in what order
+            st.markdown("### Select and Order Clips")
+            selected_clips = []
+
+            for i, clip in enumerate(result.clips):
+                col1, col2, col3 = st.columns([0.5, 2, 1])
+                with col1:
+                    include = st.checkbox(f"Include", value=True, key=f"stitch_include_{i}")
+                with col2:
+                    st.write(f"**Clip {i + 1}**: {clip.duration:.1f}s (Score: {clip.highlight.score:.2f})")
+                with col3:
+                    if clip.path.exists():
+                        st.write(f"{clip.file_size // 1024} KB")
+
+                if include and clip.path.exists():
+                    selected_clips.append(clip)
+
+            if selected_clips:
+                total_dur = sum(c.duration for c in selected_clips)
+                st.info(f"Selected {len(selected_clips)} clips, total duration: {total_dur:.1f}s")
+
+                if st.button("🔗 Stitch Selected Clips", type="primary"):
+                    try:
+                        config = st.session_state.config or Config()
+                        from src.modules.video_clipper import VideoClipper
+                        clipper = VideoClipper(config)
+
+                        with st.spinner(f"Stitching {len(selected_clips)} clips..."):
+                            output_path = clipper.concatenate_clips(
+                                clip_paths=[c.path for c in selected_clips],
+                                output_prefix="stitched_result",
+                                transition=selected_transition,
+                                transition_duration=transition_duration
+                            )
+
+                        if output_path.exists():
+                            st.success("Clips stitched successfully!")
+                            with open(output_path, 'rb') as f:
+                                video_bytes = f.read()
+                            st.video(video_bytes)
+                            with open(output_path, 'rb') as f:
+                                st.download_button(
+                                    "⬇️ Download Stitched Video",
+                                    f,
+                                    file_name="stitched_result.mp4",
+                                    mime="video/mp4"
+                                )
+                        else:
+                            st.error("Failed to create stitched video")
+
+                    except Exception as e:
+                        st.error(f"Error: {str(e)}")
+                        logger.exception("Stitch error")
+            else:
+                st.warning("No clips selected")
+        else:
+            st.info("No clips available. Process a video first in the 'Process Video' tab, then return here to stitch clips together.")
+
+
 def main():
     """Main application entry point."""
     init_session_state()
@@ -877,7 +1306,10 @@ def main():
     config = render_sidebar()
 
     # Main content with tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["🎬 Process Video", "🔍 Quick Preview", "✂️ Manual Clip", "ℹ️ About"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "🎬 Process Video", "🔍 Quick Preview", "✂️ Manual Clip",
+        "📹 Multi-Video", "🔗 Stitch Clips", "ℹ️ About"
+    ])
 
     with tab1:
         render_main_content()
@@ -889,6 +1321,12 @@ def main():
         render_manual_clip_tab()
 
     with tab4:
+        render_multi_video_tab()
+
+    with tab5:
+        render_stitch_clips_tab()
+
+    with tab6:
         st.markdown("""
         ## About Shorts Bot
 
@@ -901,29 +1339,36 @@ def main():
 
         ### Features
 
-        - 🎯 **Automatic Highlight Detection** - AI identifies the most engaging moments
-        - 🗣️ **Speech-to-Text** - Accurate transcription using OpenAI Whisper
-        - 📝 **Auto-Captions** - Viral-style animated captions
-        - 📷 **Smart Framing** - Face detection for optimal cropping
-        - 🎨 **Multiple Styles** - Choose from various caption presets
+        - **Automatic Highlight Detection** - AI identifies the most engaging moments
+        - **LLM-Powered Scoring** - Context-aware segment analysis (replaces keyword matching)
+        - **Virality Score** - Each clip gets a 0-100 viral potential prediction
+        - **AI Metadata** - Auto-generated titles, descriptions, hashtags, and hook text
+        - **Multi-Video Processing** - Upload multiple videos, stitch best highlights
+        - **Transition Effects** - Crossfade, fade-to-black, and wipe between clips
+        - **Speech-to-Text** - Accurate transcription using OpenAI Whisper
+        - **Auto-Captions** - Viral-style animated captions with LLM emoji placement
+        - **Smart Framing** - Face detection for optimal cropping
+        - **Multiple Styles** - Choose from various caption presets
 
         ### How It Works
 
-        1. Upload your long-form video
+        1. Upload your long-form video (or multiple videos)
         2. Configure your preferences
         3. Click "Process Video"
-        4. Download your ready-to-post shorts!
+        4. Review clips with virality scores and AI-suggested metadata
+        5. Download your ready-to-post shorts!
 
         ### Technical Details
 
         - **Transcription**: OpenAI Whisper (local, no API needed)
-        - **Video Processing**: FFmpeg
-        - **Face Detection**: OpenCV
+        - **Video Processing**: FFmpeg with xfade transitions
+        - **Face Detection**: OpenCV (DNN + Haar cascade)
+        - **LLM Intelligence**: Local Llama 3.1 via llama-cpp (Metal on Apple Silicon)
         - **100% Local** - Your videos never leave your computer
 
         ---
 
-        Made with ❤️ using Python, Streamlit, and open-source tools.
+        Made with Python, Streamlit, and open-source tools.
         """)
 
         # Show current config

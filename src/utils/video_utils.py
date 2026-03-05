@@ -6,7 +6,7 @@ Provides video information extraction, audio extraction, and format conversion.
 import subprocess
 import json
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from dataclasses import dataclass
 
 from ..core.logger import get_logger
@@ -321,7 +321,7 @@ def detect_silence(
     audio_path: Path,
     threshold_db: float = -40,
     min_duration: float = 0.5
-) -> list[Tuple[float, float]]:
+) -> List[Tuple[float, float]]:
     """
     Detect silent segments in audio.
 
@@ -366,9 +366,9 @@ def detect_silence(
 def get_volume_levels(
     audio_path: Path,
     interval: float = 0.5
-) -> list[Tuple[float, float]]:
+) -> List[Tuple[float, float]]:
     """
-    Get volume levels throughout audio file.
+    Get volume levels throughout audio file using FFmpeg volumedetect per segment.
 
     Args:
         audio_path: Path to audio file
@@ -377,22 +377,113 @@ def get_volume_levels(
     Returns:
         List of (timestamp, volume_db) tuples
     """
+    # Get total duration first
+    info = get_video_info(audio_path)
+    total_duration = info.duration
+    if total_duration <= 0:
+        return []
+
+    volumes = []
+
+    # Use ebur128 filter for accurate loudness per segment
     cmd = [
         'ffmpeg',
         '-i', str(audio_path),
-        '-af', f'astats=metadata=1:reset={int(1/interval)}',
+        '-af', f'astats=metadata=1:reset={int(1/interval)},ametadata=print:key=lavfi.astats.Overall.RMS_level',
         '-f', 'null', '-'
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    # Parse volume data from stderr
-    # This is a simplified version - full implementation would parse lavfi metadata
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        output = result.stderr
 
-    return []  # Placeholder - would need more complex parsing
+        import re
+        # Parse RMS levels from ametadata output
+        time_pattern = re.compile(r'pts_time:(\d+\.?\d*)')
+        rms_pattern = re.compile(r'lavfi\.astats\.Overall\.RMS_level=(-?\d+\.?\d*)')
+
+        current_time = 0.0
+        for line in output.split('\n'):
+            time_match = time_pattern.search(line)
+            if time_match:
+                current_time = float(time_match.group(1))
+            rms_match = rms_pattern.search(line)
+            if rms_match:
+                rms_db = float(rms_match.group(1))
+                volumes.append((current_time, rms_db))
+    except Exception as e:
+        logger.warning(f"Volume analysis failed: {e}")
+
+    # If ffmpeg metadata parsing didn't work, fall back to segment-by-segment analysis
+    if not volumes:
+        step = max(interval, 1.0)
+        t = 0.0
+        while t < total_duration:
+            segment_duration = min(step, total_duration - t)
+            cmd = [
+                'ffmpeg',
+                '-ss', str(t),
+                '-t', str(segment_duration),
+                '-i', str(audio_path),
+                '-af', 'volumedetect',
+                '-f', 'null', '-'
+            ]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                import re
+                mean_match = re.search(r'mean_volume:\s*(-?\d+\.?\d*)\s*dB', result.stderr)
+                if mean_match:
+                    volumes.append((t + segment_duration / 2, float(mean_match.group(1))))
+            except Exception:
+                pass
+            t += step
+
+    return volumes
+
+
+def get_audio_energy_profile(
+    audio_path: Path,
+    window_seconds: float = 2.0
+) -> List[Dict[str, Any]]:
+    """
+    Get a detailed audio energy profile for highlight detection.
+    Analyzes volume, speech rate indicators, and energy changes.
+
+    Args:
+        audio_path: Path to audio file
+        window_seconds: Analysis window size in seconds
+
+    Returns:
+        List of dicts with timestamp, energy, and change metrics
+    """
+    volumes = get_volume_levels(audio_path, interval=window_seconds)
+    if not volumes:
+        return []
+
+    profile = []
+    for i, (timestamp, volume_db) in enumerate(volumes):
+        # Normalize volume to 0-1 scale (typical speech is -30 to -10 dB)
+        normalized = max(0.0, min(1.0, (volume_db + 50) / 40))
+
+        # Calculate energy change from previous window
+        energy_change = 0.0
+        if i > 0:
+            prev_vol = volumes[i - 1][1]
+            energy_change = volume_db - prev_vol
+
+        profile.append({
+            'timestamp': timestamp,
+            'volume_db': volume_db,
+            'energy': normalized,
+            'energy_change': energy_change,
+            'is_speech': volume_db > -40,  # Above silence threshold
+        })
+
+    return profile
 
 
 def concatenate_videos(
-    input_paths: list[Path],
+    input_paths: List[Path],
     output_path: Path,
     transition: Optional[str] = None
 ) -> Path:

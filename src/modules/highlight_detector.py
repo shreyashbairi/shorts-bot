@@ -106,6 +106,43 @@ class HighlightDetector:
     Falls back to rule-based detection when LLM is disabled.
     """
 
+    # Content analysis patterns
+    emotion_words = {
+        'positive': {'amazing', 'incredible', 'wonderful', 'love', 'excited', 'happy',
+                     'great', 'best', 'beautiful', 'brilliant', 'perfect', 'fantastic',
+                     'awesome', 'excellent', 'outstanding', 'remarkable'},
+        'negative': {'terrible', 'awful', 'hate', 'angry', 'frustrated', 'worst',
+                     'horrible', 'disgusting', 'pathetic', 'ridiculous', 'insane',
+                     'devastating', 'horrifying', 'shocking'},
+        'intense': {'absolutely', 'definitely', 'completely', 'totally', 'extremely',
+                    'insane', 'crazy', 'unbelievable', 'massive', 'enormous',
+                    'literally', 'genuinely', 'seriously', 'fundamentally'},
+    }
+
+    insight_patterns = [
+        r'\bthe (key|secret|trick|truth|reality|fact|problem|issue) is\b',
+        r'\bhere\'?s (what|how|why|the thing)\b',
+        r'\bwhat (people|most|nobody|everyone) (don\'?t |doesn\'?t )?(know|realize|understand)\b',
+        r'\bthe (reason|way) (to|you|that|it)\b',
+        r'\b(most importantly|the bottom line|in other words)\b',
+        r'\b(research shows|studies show|data shows|evidence suggests)\b',
+        r'\b(first|second|third|number one|the biggest)\b',
+        r'\b(changed my life|game changer|breakthrough|turning point)\b',
+        r'\b(this is (why|how|what)|let me (explain|tell you))\b',
+        r'\b(the difference between|compared to|unlike)\b',
+    ]
+
+    story_patterns = [
+        r'\b(once upon|one day|one time|there was)\b',
+        r'\b(let me tell you|i remember|i recall|back when)\b',
+        r'\b(the story|what happened|it all started)\b',
+        r'\b(and then|suddenly|all of a sudden|out of nowhere)\b',
+        r'\b(i was like|he said|she said|they told me)\b',
+        r'\b(years ago|when i was|growing up)\b',
+        r'\b(true story|no joke|i swear|believe it or not)\b',
+        r'\b(the craziest|the funniest|the scariest|the worst) (thing|part|moment)\b',
+    ]
+
     def __init__(self, config: Config):
         """
         Initialize the highlight detector.
@@ -117,6 +154,7 @@ class HighlightDetector:
         self.hl_config = config.highlight
         self.temp_dir = ensure_dir(config.temp_dir / "highlights")
         self._llm = None  # Lazy initialization
+        self._audio_profile = None  # Cached audio energy profile
 
     def detect_highlights(
         self,
@@ -164,7 +202,11 @@ class HighlightDetector:
             else:
                 logger.warning("LLM detection failed, falling back to rule-based")
 
-        # Fallback: Rule-based detection
+        # Load audio energy profile if audio is available
+        if audio_path:
+            self._load_audio_profile(audio_path)
+
+        # Fallback: Rule-based detection with full scoring
         highlights = self._detect_highlights_rule_based(transcript, filler_segments, silence_segments)
 
         # Calculate coverage
@@ -180,7 +222,51 @@ class HighlightDetector:
         )
 
         logger.info(f"Found {len(highlights)} potential highlights ({coverage * 100:.1f}% coverage)")
+
+        # Add virality scores and metadata if LLM is available
+        if self.hl_config.use_llm and highlights:
+            top = result.get_top_highlights(self.hl_config.target_clips)
+            top = self.predict_virality_scores(top)
+            top = self.generate_clip_metadata(top)
+
         return result
+
+    def _load_audio_profile(self, audio_path: Path):
+        """Load audio energy profile for use in scoring."""
+        try:
+            from ..utils.video_utils import get_audio_energy_profile
+            self._audio_profile = get_audio_energy_profile(audio_path, window_seconds=2.0)
+            logger.debug(f"Loaded audio profile with {len(self._audio_profile)} data points")
+        except Exception as e:
+            logger.warning(f"Could not load audio profile: {e}")
+            self._audio_profile = None
+
+    def _get_audio_energy_for_range(self, start: float, end: float) -> float:
+        """Get average audio energy for a time range (0-1 scale)."""
+        if not self._audio_profile:
+            return 0.5  # Neutral default
+
+        relevant = [p for p in self._audio_profile
+                     if p['timestamp'] >= start and p['timestamp'] <= end]
+        if not relevant:
+            return 0.5
+
+        return sum(p['energy'] for p in relevant) / len(relevant)
+
+    def _get_energy_variance_for_range(self, start: float, end: float) -> float:
+        """Get energy variance (dynamic range) for a time range. Higher = more dynamic."""
+        if not self._audio_profile:
+            return 0.0
+
+        relevant = [p for p in self._audio_profile
+                     if p['timestamp'] >= start and p['timestamp'] <= end]
+        if len(relevant) < 2:
+            return 0.0
+
+        energies = [p['energy'] for p in relevant]
+        mean = sum(energies) / len(energies)
+        variance = sum((e - mean) ** 2 for e in energies) / len(energies)
+        return min(variance * 10, 1.0)  # Scale up and cap at 1.0
 
     def _detect_highlights_with_llm(self, transcript: Transcript) -> List[Highlight]:
         """
@@ -247,12 +333,84 @@ Return ONLY the JSON array, no other text."""
             return []
 
     def _format_transcript_for_llm(self, transcript: Transcript) -> str:
-        """Format transcript with timestamps for LLM analysis."""
+        """Format transcript with timestamps for LLM analysis, chunking if too long."""
         lines = []
         for segment in transcript.segments:
-            # Format: [start-end] text
             lines.append(f"[{segment.start:.1f}-{segment.end:.1f}] {segment.text}")
-        return "\n".join(lines)
+
+        full_text = "\n".join(lines)
+
+        # Estimate token count (~4 chars per token)
+        estimated_tokens = len(full_text) // 4
+        max_context = self.hl_config.llm_n_ctx
+
+        # Reserve tokens for system prompt, user prompt template, and response
+        available_tokens = max_context - 1500
+
+        if estimated_tokens <= available_tokens:
+            return full_text
+
+        # Transcript too long - use smart chunking
+        logger.info(f"Transcript too long ({estimated_tokens} est. tokens), using smart chunking")
+        return self._chunk_transcript_for_llm(transcript, available_tokens)
+
+    def _chunk_transcript_for_llm(self, transcript: Transcript, max_tokens: int) -> str:
+        """
+        Smart chunking: include overview + detailed high-potential sections.
+        This ensures the LLM sees the full context while focusing on the best parts.
+        """
+        # Create condensed overview
+        overview_lines = []
+        chunk_size = max(1, len(transcript.segments) // 20)
+
+        for i in range(0, len(transcript.segments), chunk_size):
+            chunk = transcript.segments[i:i + chunk_size]
+            start = chunk[0].start
+            end = chunk[-1].end
+            text_preview = ' '.join(s.text for s in chunk)
+            if len(text_preview) > 100:
+                text_preview = text_preview[:100] + "..."
+            overview_lines.append(f"[{start:.0f}-{end:.0f}s] {text_preview}")
+
+        overview = "OVERVIEW (condensed):\n" + "\n".join(overview_lines)
+
+        # Pre-score segments to find promising areas
+        scored_segments = []
+        for seg in transcript.segments:
+            score, _ = self._score_segment_simple(seg)
+            scored_segments.append((score, seg))
+
+        scored_segments.sort(key=lambda x: x[0], reverse=True)
+
+        # Include detailed text for top segments with surrounding context
+        detail_lines = []
+        included_ranges = set()
+        chars_budget = max_tokens * 3  # Rough chars-to-tokens ratio
+
+        for score, seg in scored_segments:
+            seg_idx = transcript.segments.index(seg)
+            context_start = max(0, seg_idx - 2)
+            context_end = min(len(transcript.segments), seg_idx + 3)
+
+            range_key = (context_start, context_end)
+            if range_key in included_ranges:
+                continue
+
+            context_segs = transcript.segments[context_start:context_end]
+            context_text = "\n".join(
+                f"[{s.start:.1f}-{s.end:.1f}] {s.text}" for s in context_segs
+            )
+
+            if len("\n".join(detail_lines)) + len(context_text) > chars_budget:
+                break
+
+            detail_lines.append(f"\n--- High-potential section (score {score:.2f}) ---")
+            detail_lines.append(context_text)
+            included_ranges.add(range_key)
+
+        details = "DETAILED SECTIONS:\n" + "\n".join(detail_lines)
+
+        return f"{overview}\n\n{details}"
 
     def _parse_llm_highlights(self, response: str, transcript: Transcript) -> List[Highlight]:
         """Parse LLM response into Highlight objects."""
@@ -472,27 +630,168 @@ Return ONLY the JSON array, no other text."""
             logger.warning(f"Failed to create cohesive clip: {e}")
             return None
 
+    def predict_virality_scores(self, highlights: List[Highlight]) -> List[Highlight]:
+        """
+        Use LLM to predict virality score (0-100) for each highlight.
+        Adds 'virality_score' and 'virality_explanation' to highlight metadata.
+        """
+        llm = self._init_llm()
+        if llm is None or not highlights:
+            # Fallback: use existing score * 100
+            for h in highlights:
+                h.metadata['virality_score'] = int(h.score * 100)
+                h.metadata['virality_explanation'] = 'Based on content analysis score'
+            return highlights
+
+        try:
+            clips_desc = []
+            for i, h in enumerate(highlights, 1):
+                text_preview = h.text[:300] if len(h.text) > 300 else h.text
+                clips_desc.append(f'{i}. [{h.duration:.0f}s] "{text_preview}"')
+
+            prompt = f"""Rate each video clip's viral potential on social media (0-100 scale).
+
+CLIPS:
+{chr(10).join(clips_desc)}
+
+For each clip, evaluate:
+- Hook strength (0-20): Does the opening grab attention in <3 seconds?
+- Emotional resonance (0-20): Does it trigger sharing impulse (surprise, humor, awe, outrage)?
+- Shareability (0-20): Would viewers tag friends or repost?
+- Completeness (0-20): Is it self-contained? Does it deliver a payoff?
+- Trend alignment (0-20): Does it fit current social media content patterns?
+
+OUTPUT FORMAT (JSON array):
+[{{"clip": 1, "score": 78, "explanation": "Strong hook with surprising reveal, highly shareable"}}, {{"clip": 2, "score": 45, "explanation": "Good insight but slow start reduces viral potential"}}]
+
+Return ONLY the JSON array."""
+
+            response = llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": "You are a social media virality analyst. You predict how well video clips will perform on TikTok, YouTube Shorts, and Instagram Reels based on content analysis."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=self.hl_config.llm_max_tokens,
+                temperature=self.hl_config.llm_temperature,
+            )
+
+            response_text = response['choices'][0]['message']['content'].strip()
+            json_match = re.search(r'\[[\s\S]*\]', response_text)
+            if json_match:
+                scores = json.loads(json_match.group())
+                for item in scores:
+                    idx = int(item.get('clip', 0)) - 1
+                    if 0 <= idx < len(highlights):
+                        highlights[idx].metadata['virality_score'] = int(item.get('score', 50))
+                        highlights[idx].metadata['virality_explanation'] = item.get('explanation', '')
+
+        except Exception as e:
+            logger.warning(f"Virality scoring failed: {e}")
+
+        # Fill in any missing scores
+        for h in highlights:
+            if 'virality_score' not in h.metadata:
+                h.metadata['virality_score'] = int(h.score * 100)
+                h.metadata['virality_explanation'] = 'Based on content analysis score'
+
+        return highlights
+
+    def generate_clip_metadata(self, highlights: List[Highlight]) -> List[Highlight]:
+        """
+        Use LLM to generate titles, descriptions, and hashtags for each clip.
+        Adds 'suggested_title', 'suggested_description', 'suggested_hashtags' to metadata.
+        """
+        llm = self._init_llm()
+        if llm is None or not highlights:
+            return highlights
+
+        try:
+            clips_desc = []
+            for i, h in enumerate(highlights, 1):
+                text_preview = h.text[:300] if len(h.text) > 300 else h.text
+                clips_desc.append(f'{i}. [{h.duration:.0f}s] "{text_preview}"')
+
+            prompt = f"""Generate social media metadata for these video clips.
+
+CLIPS:
+{chr(10).join(clips_desc)}
+
+For each clip generate:
+- title: Attention-grabbing title (max 60 chars, no clickbait)
+- description: Brief engaging description (max 150 chars)
+- hashtags: 5 relevant hashtags (without #)
+- hook_text: A text overlay for the first 3 seconds to hook viewers
+
+OUTPUT FORMAT (JSON array):
+[{{"clip": 1, "title": "...", "description": "...", "hashtags": ["tag1", "tag2"], "hook_text": "..."}}]
+
+Return ONLY the JSON array."""
+
+            response = llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": "You are a social media content strategist. Generate compelling, authentic metadata for short-form videos. Avoid clickbait but maximize curiosity."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=self.hl_config.llm_max_tokens,
+                temperature=0.7,
+            )
+
+            response_text = response['choices'][0]['message']['content'].strip()
+            json_match = re.search(r'\[[\s\S]*\]', response_text)
+            if json_match:
+                metadata_list = json.loads(json_match.group())
+                for item in metadata_list:
+                    idx = int(item.get('clip', 0)) - 1
+                    if 0 <= idx < len(highlights):
+                        highlights[idx].metadata['suggested_title'] = item.get('title', '')
+                        highlights[idx].metadata['suggested_description'] = item.get('description', '')
+                        highlights[idx].metadata['suggested_hashtags'] = item.get('hashtags', [])
+                        highlights[idx].metadata['hook_text'] = item.get('hook_text', '')
+
+        except Exception as e:
+            logger.warning(f"Clip metadata generation failed: {e}")
+
+        return highlights
+
     def _detect_highlights_rule_based(
         self,
         transcript: Transcript,
         filler_segments: List[Tuple[float, float]],
         silence_segments: List[Tuple[float, float]]
     ) -> List[Highlight]:
-        """Fallback rule-based highlight detection."""
-        # Score each segment using simple heuristics
+        """Highlight detection with LLM-enhanced scoring when available, falling back to rules."""
+        # Try LLM batch scoring first (replaces hardcoded pattern matching)
+        if self.hl_config.use_llm:
+            llm_success = self._score_segments_with_llm(transcript)
+            if llm_success:
+                logger.info("Using LLM-scored segments for highlight detection")
+
+        # Score each segment (uses LLM cache if available, else rules)
         segment_scores = []
         for segment in transcript.segments:
-            score, reasons = self._score_segment_simple(segment)
+            score, reasons = self._score_segment(segment, transcript)
+
+            # Boost score with audio energy if available
+            audio_energy = self._get_audio_energy_for_range(segment.start, segment.end)
+            energy_variance = self._get_energy_variance_for_range(segment.start, segment.end)
+
+            # High energy speech boosts score, dynamic range indicates excitement
+            audio_boost = (audio_energy - 0.5) * 0.2 + energy_variance * 0.15
+            score = max(0.05, min(1.0, score + audio_boost))
+
+            if audio_energy > 0.7:
+                reasons.append(HighlightReason.HIGH_ENERGY)
+
             segment_scores.append({
                 'segment': segment,
                 'score': score,
                 'reasons': reasons
             })
 
-        # Group into clips
-        highlights = self._create_clips(
+        # Use sliding window approach to find best clip windows
+        highlights = self._find_best_windows(
             segment_scores,
-            transcript.duration,
+            transcript,
             filler_segments,
             silence_segments
         )
@@ -521,6 +820,188 @@ Return ONLY the JSON array, no other text."""
 
         return min(score, 1.0), reasons
 
+    def _find_best_windows(
+        self,
+        segment_scores: List[Dict],
+        transcript: Transcript,
+        filler_segments: List[Tuple[float, float]],
+        silence_segments: List[Tuple[float, float]]
+    ) -> List[Highlight]:
+        """
+        Use a sliding window approach to find the best clip windows.
+
+        Instead of grouping from individual segments, this evaluates
+        windows of the target duration across the transcript to find
+        naturally coherent, high-scoring sections.
+        """
+        min_duration = self.hl_config.min_clip_duration
+        max_duration = self.hl_config.max_clip_duration
+        target_clips = self.hl_config.target_clips
+        total_duration = transcript.duration
+
+        if not segment_scores or total_duration <= 0:
+            return []
+
+        # Build a list of candidate windows
+        candidates = []
+        step = max(2.0, min_duration / 4)  # Step size for window sliding
+
+        for target_dur in range(min_duration, max_duration + 1, max(5, (max_duration - min_duration) // 4 or 1)):
+            window_start = 0.0
+            while window_start + min_duration <= total_duration:
+                window_end = min(window_start + target_dur, total_duration)
+
+                # Collect segments within this window
+                window_segments = [
+                    s for s in segment_scores
+                    if s['segment'].start >= window_start and s['segment'].end <= window_end
+                ]
+
+                if not window_segments:
+                    window_start += step
+                    continue
+
+                # Calculate window score as weighted average
+                total_score = 0.0
+                total_weight = 0.0
+                all_reasons = set()
+
+                for s in window_segments:
+                    # Weight by segment duration (longer segments matter more)
+                    weight = s['segment'].duration
+                    total_score += s['score'] * weight
+                    total_weight += weight
+                    all_reasons.update(s['reasons'])
+
+                if total_weight > 0:
+                    avg_score = total_score / total_weight
+                else:
+                    avg_score = 0.0
+
+                # Bonus for windows that start with a strong hook
+                first_seg = window_segments[0]
+                if first_seg['score'] > 0.5:
+                    avg_score += 0.1
+
+                # Bonus for coherent content (many segments = flowing speech)
+                if len(window_segments) >= 3:
+                    avg_score += 0.05
+
+                # Penalty for filler/silence overlap
+                filler_overlap = self._calc_overlap_ratio(
+                    window_start, window_end,
+                    filler_segments + silence_segments
+                )
+                avg_score -= filler_overlap * 0.3
+
+                avg_score = max(0.05, min(1.0, avg_score))
+
+                # Get text for this window
+                text = ' '.join(s['segment'].text for s in window_segments)
+
+                candidates.append({
+                    'start': window_start,
+                    'end': window_end,
+                    'score': avg_score,
+                    'reasons': list(all_reasons) or [HighlightReason.KEY_INSIGHT],
+                    'text': text,
+                    'segment_count': len(window_segments),
+                })
+
+                window_start += step
+
+        if not candidates:
+            return self._create_fallback_clips(segment_scores, total_duration, [])
+
+        # Sort candidates by score
+        candidates.sort(key=lambda c: c['score'], reverse=True)
+
+        # Select non-overlapping top candidates
+        selected = []
+        used_ranges = []
+
+        for candidate in candidates:
+            if len(selected) >= target_clips:
+                break
+
+            # Check overlap with already selected
+            overlaps = False
+            for used_start, used_end in used_ranges:
+                if candidate['start'] < used_end and candidate['end'] > used_start:
+                    overlaps = True
+                    break
+
+            if overlaps:
+                continue
+
+            # Snap to sentence boundaries
+            adj_start, adj_end, adj_text = self._adjust_to_sentence_boundaries(
+                transcript, candidate['start'], candidate['end']
+            )
+
+            # Ensure adjusted clip still meets duration requirements
+            adj_duration = adj_end - adj_start
+            effective_min = min(min_duration, total_duration * 0.5)
+            if adj_duration < effective_min or adj_duration > max_duration * 1.2:
+                # Use original boundaries if adjustment breaks constraints
+                adj_start = candidate['start']
+                adj_end = candidate['end']
+                adj_text = candidate['text']
+
+            highlight = Highlight(
+                start=adj_start,
+                end=adj_end,
+                text=adj_text,
+                score=candidate['score'],
+                reasons=candidate['reasons'],
+                metadata={
+                    'segment_count': candidate['segment_count'],
+                    'method': 'sliding_window'
+                }
+            )
+
+            selected.append(highlight)
+            used_ranges.append((adj_start, adj_end))
+
+        # If we didn't find enough, fall back to the old method
+        if len(selected) < target_clips:
+            remaining = self._create_clips(
+                segment_scores, total_duration,
+                filler_segments, silence_segments
+            )
+            for h in remaining:
+                if len(selected) >= target_clips:
+                    break
+                # Check overlap
+                overlaps = any(
+                    h.start < ue and h.end > us
+                    for us, ue in used_ranges
+                )
+                if not overlaps:
+                    selected.append(h)
+                    used_ranges.append((h.start, h.end))
+
+        # Sort by time
+        selected.sort(key=lambda h: h.start)
+        return selected
+
+    def _calc_overlap_ratio(
+        self,
+        start: float,
+        end: float,
+        avoid_ranges: List[Tuple[float, float]]
+    ) -> float:
+        """Calculate the fraction of [start, end] that overlaps with avoid_ranges."""
+        if end <= start:
+            return 0.0
+        total_overlap = 0.0
+        for a_start, a_end in avoid_ranges:
+            overlap_start = max(start, a_start)
+            overlap_end = min(end, a_end)
+            if overlap_start < overlap_end:
+                total_overlap += overlap_end - overlap_start
+        return total_overlap / (end - start)
+
     def _score_segment(
         self,
         segment: Segment,
@@ -528,48 +1009,222 @@ Return ONLY the JSON array, no other text."""
     ) -> Tuple[float, List[HighlightReason]]:
         """
         Score a single segment for highlight potential.
-
-        Args:
-            segment: Segment to score
-            transcript: Full transcript for context
-
-        Returns:
-            Tuple of (score, reasons)
+        Uses LLM batch scoring when available, falls back to rule-based.
         """
-        # Start with a base score so all segments have some value
+        # Check if we have cached LLM scores for this segment
+        if hasattr(self, '_llm_segment_scores') and self._llm_segment_scores:
+            cached = self._llm_segment_scores.get(segment.id)
+            if cached:
+                return cached['score'], cached['reasons']
+
+        # Fallback to rule-based scoring
+        return self._score_segment_rules(segment, transcript)
+
+    def _score_segments_with_llm(self, transcript: Transcript) -> bool:
+        """
+        Batch-score all segments using LLM for context-aware analysis.
+        Results are cached in self._llm_segment_scores.
+        Returns True if successful.
+        """
+        llm = self._init_llm()
+        if llm is None:
+            return False
+
+        self._llm_segment_scores = {}
+
+        try:
+            # Build segment list for LLM
+            seg_texts = []
+            for i, seg in enumerate(transcript.segments):
+                seg_texts.append(f"{i+1}. [{seg.start:.1f}-{seg.end:.1f}s] {seg.text}")
+
+            segments_block = "\n".join(seg_texts)
+
+            # Estimate tokens and chunk if needed
+            estimated_tokens = len(segments_block) // 4
+            available_tokens = self.hl_config.llm_n_ctx - 1500
+
+            if estimated_tokens > available_tokens:
+                # Process in chunks
+                return self._score_segments_with_llm_chunked(transcript, llm)
+
+            prompt = f"""Score each transcript segment for short-form video potential (0.0-1.0).
+
+SEGMENTS:
+{segments_block}
+
+For each segment, analyze:
+- Emotional intensity (excitement, surprise, humor, passion)
+- Insight value (teaches something, reveals truth, shares wisdom)
+- Engagement potential (hooks attention, asks questions, addresses viewer)
+- Story quality (narrative moments, dramatic tension, punchlines)
+- Quotability (memorable, shareable, punchy statements)
+- Pacing (confident delivery vs hesitant/filler-heavy)
+
+OUTPUT FORMAT (JSON object mapping segment number to score and top reason):
+{{"1": {{"score": 0.7, "reason": "emotional_peak"}}, "2": {{"score": 0.3, "reason": "key_insight"}}}}
+
+Valid reasons: emotional_peak, key_insight, strong_opinion, engaging_question, high_energy, story_moment, quotable, topic_intro, conclusion
+
+Return ONLY the JSON object."""
+
+            response = llm.create_chat_completion(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert at identifying viral content. Score transcript segments by their potential to captivate social media viewers. Be discriminating - most segments should score below 0.4, only truly engaging moments score above 0.7."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=self.hl_config.llm_max_tokens,
+                temperature=self.hl_config.llm_temperature,
+            )
+
+            response_text = response['choices'][0]['message']['content'].strip()
+            json_match = re.search(r'\{[\s\S]*\}', response_text)
+            if not json_match:
+                return False
+
+            scores_data = json.loads(json_match.group())
+
+            reason_map = {
+                'emotional_peak': HighlightReason.EMOTIONAL_PEAK,
+                'key_insight': HighlightReason.KEY_INSIGHT,
+                'strong_opinion': HighlightReason.STRONG_OPINION,
+                'engaging_question': HighlightReason.ENGAGING_QUESTION,
+                'high_energy': HighlightReason.HIGH_ENERGY,
+                'story_moment': HighlightReason.STORY_MOMENT,
+                'quotable': HighlightReason.QUOTABLE,
+                'topic_intro': HighlightReason.TOPIC_INTRO,
+                'conclusion': HighlightReason.CONCLUSION,
+            }
+
+            for key, data in scores_data.items():
+                try:
+                    idx = int(key) - 1
+                    if 0 <= idx < len(transcript.segments):
+                        seg = transcript.segments[idx]
+                        score = float(data.get('score', 0.1))
+                        reason_str = data.get('reason', 'key_insight')
+                        reason = reason_map.get(reason_str, HighlightReason.KEY_INSIGHT)
+                        self._llm_segment_scores[seg.id] = {
+                            'score': max(0.05, min(1.0, score)),
+                            'reasons': [reason]
+                        }
+                except (ValueError, KeyError):
+                    continue
+
+            logger.info(f"LLM scored {len(self._llm_segment_scores)}/{len(transcript.segments)} segments")
+            return len(self._llm_segment_scores) > 0
+
+        except Exception as e:
+            logger.warning(f"LLM segment scoring failed: {e}")
+            return False
+
+    def _score_segments_with_llm_chunked(self, transcript: Transcript, llm) -> bool:
+        """Score segments in chunks when transcript is too long for single LLM call."""
+        self._llm_segment_scores = {}
+        chunk_size = 30  # segments per chunk
+
+        reason_map = {
+            'emotional_peak': HighlightReason.EMOTIONAL_PEAK,
+            'key_insight': HighlightReason.KEY_INSIGHT,
+            'strong_opinion': HighlightReason.STRONG_OPINION,
+            'engaging_question': HighlightReason.ENGAGING_QUESTION,
+            'high_energy': HighlightReason.HIGH_ENERGY,
+            'story_moment': HighlightReason.STORY_MOMENT,
+            'quotable': HighlightReason.QUOTABLE,
+            'topic_intro': HighlightReason.TOPIC_INTRO,
+            'conclusion': HighlightReason.CONCLUSION,
+        }
+
+        for chunk_start in range(0, len(transcript.segments), chunk_size):
+            chunk = transcript.segments[chunk_start:chunk_start + chunk_size]
+            seg_texts = []
+            for i, seg in enumerate(chunk):
+                global_idx = chunk_start + i + 1
+                seg_texts.append(f"{global_idx}. [{seg.start:.1f}-{seg.end:.1f}s] {seg.text}")
+
+            prompt = f"""Score each segment for viral short-form video potential (0.0-1.0).
+
+SEGMENTS:
+{chr(10).join(seg_texts)}
+
+Analyze emotional intensity, insight value, engagement, story quality, quotability.
+OUTPUT: JSON object mapping segment number to score and reason.
+{{"1": {{"score": 0.7, "reason": "emotional_peak"}}}}
+Valid reasons: emotional_peak, key_insight, strong_opinion, engaging_question, high_energy, story_moment, quotable, topic_intro, conclusion
+Return ONLY JSON."""
+
+            try:
+                response = llm.create_chat_completion(
+                    messages=[
+                        {"role": "system", "content": "Score transcript segments for viral potential. Be discriminating."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=self.hl_config.llm_max_tokens,
+                    temperature=self.hl_config.llm_temperature,
+                )
+                response_text = response['choices'][0]['message']['content'].strip()
+                json_match = re.search(r'\{[\s\S]*\}', response_text)
+                if json_match:
+                    scores_data = json.loads(json_match.group())
+                    for key, data in scores_data.items():
+                        try:
+                            idx = int(key) - 1
+                            if 0 <= idx < len(transcript.segments):
+                                seg = transcript.segments[idx]
+                                score = float(data.get('score', 0.1))
+                                reason_str = data.get('reason', 'key_insight')
+                                reason = reason_map.get(reason_str, HighlightReason.KEY_INSIGHT)
+                                self._llm_segment_scores[seg.id] = {
+                                    'score': max(0.05, min(1.0, score)),
+                                    'reasons': [reason]
+                                }
+                        except (ValueError, KeyError):
+                            continue
+            except Exception as e:
+                logger.warning(f"LLM chunk scoring failed: {e}")
+
+        return len(self._llm_segment_scores) > 0
+
+    def _score_segment_rules(
+        self,
+        segment: Segment,
+        transcript: Transcript
+    ) -> Tuple[float, List[HighlightReason]]:
+        """Rule-based segment scoring (fallback when LLM unavailable)."""
         score = 0.1
         reasons = []
-        text_lower = segment.text.lower()
 
-        # Give a small bonus for segments with more content
         word_count = len(segment.text.split())
         if word_count >= 5:
             score += 0.05
         if word_count >= 10:
             score += 0.05
 
-        # Emotional content scoring (use lower threshold)
+        # Emotional content
         emotion_score = self._score_emotional_content(segment.text)
         if emotion_score > 0.1:
             score += emotion_score * self.hl_config.emotional_weight
             if emotion_score > 0.2:
                 reasons.append(HighlightReason.EMOTIONAL_PEAK)
 
-        # Insight/key point scoring (use lower threshold)
+        # Insight scoring
         insight_score = self._score_insights(segment.text)
         if insight_score > 0.1:
             score += insight_score * self.hl_config.insight_weight
             if insight_score > 0.2:
                 reasons.append(HighlightReason.KEY_INSIGHT)
 
-        # Engagement scoring (questions, direct address) (use lower threshold)
+        # Engagement scoring
         engagement_score = self._score_engagement(segment.text)
         if engagement_score > 0.1:
             score += engagement_score * self.hl_config.engagement_weight
             if '?' in segment.text:
                 reasons.append(HighlightReason.ENGAGING_QUESTION)
 
-        # Pacing/energy scoring (always add some contribution)
+        # Pacing
         pacing_score = self._score_pacing(segment)
         score += pacing_score * self.hl_config.pacing_weight * 0.5
         if pacing_score > 0.5:
@@ -580,23 +1235,21 @@ Return ONLY the JSON array, no other text."""
             score += 0.2
             reasons.append(HighlightReason.STORY_MOMENT)
 
-        # Strong opinion detection
+        # Strong opinion
         if self._is_strong_opinion(segment.text):
             score += 0.15
             reasons.append(HighlightReason.STRONG_OPINION)
 
-        # Quotable content (short, punchy statements)
+        # Quotable
         if self._is_quotable(segment):
             score += 0.1
             reasons.append(HighlightReason.QUOTABLE)
 
-        # Penalize segments with too many filler words (but less severely)
+        # Filler penalty
         filler_penalty = self._calculate_filler_penalty(segment.text) * 0.5
         score -= filler_penalty
 
-        # Normalize score to 0-1 range (ensure minimum of 0.05)
         score = max(0.05, min(1.0, score))
-
         return score, reasons
 
     def _score_emotional_content(self, text: str) -> float:
@@ -606,7 +1259,6 @@ Return ONLY the JSON array, no other text."""
 
         score = 0.0
 
-        # Check emotion word categories
         for category, emotion_words in self.emotion_words.items():
             matches = len(words & emotion_words)
             if category == 'intense':
@@ -614,11 +1266,9 @@ Return ONLY the JSON array, no other text."""
             else:
                 score += matches * 0.1
 
-        # Check punctuation (exclamation marks indicate emotion)
         exclamation_count = text.count('!')
         score += min(exclamation_count * 0.1, 0.3)
 
-        # Check for ALL CAPS words (emphasis)
         caps_words = len(re.findall(r'\b[A-Z]{3,}\b', text))
         score += min(caps_words * 0.1, 0.2)
 
@@ -633,11 +1283,9 @@ Return ONLY the JSON array, no other text."""
             if re.search(pattern, text_lower):
                 score += 0.25
 
-        # Check for numbers/statistics (often indicate insights)
         number_matches = len(re.findall(r'\b\d+(?:\.\d+)?%?\b', text))
         score += min(number_matches * 0.1, 0.3)
 
-        # Check for comparison language
         comparison_words = {'more', 'less', 'better', 'worse', 'faster', 'slower', 'bigger', 'smaller'}
         if any(word in text_lower for word in comparison_words):
             score += 0.1
@@ -648,16 +1296,13 @@ Return ONLY the JSON array, no other text."""
         """Score text for engagement potential."""
         score = 0.0
 
-        # Questions engage viewers
         question_count = text.count('?')
         score += min(question_count * 0.2, 0.4)
 
-        # Direct address ("you", "your")
         text_lower = text.lower()
         if re.search(r'\byou(r)?\b', text_lower):
             score += 0.15
 
-        # Call to action language
         cta_patterns = [
             r'\b(think about|imagine|consider|look at)\b',
             r'\b(here\'?s (what|how|why))\b',
@@ -676,8 +1321,6 @@ Return ONLY the JSON array, no other text."""
 
         wpm = calculate_speech_rate(segment.text, segment.duration)
 
-        # Optimal range for engaging content: 140-180 WPM
-        # Too slow can be boring, too fast can be hard to follow
         if 140 <= wpm <= 180:
             return 0.8
         elif 120 <= wpm < 140 or 180 < wpm <= 200:
@@ -710,15 +1353,12 @@ Return ONLY the JSON array, no other text."""
         """Check if segment is quotable (short, punchy, complete thought)."""
         word_count = len(segment.text.split())
 
-        # Quotable segments are typically 5-20 words
         if not (5 <= word_count <= 20):
             return False
 
-        # Should be a complete thought (ends with punctuation)
         if not segment.text.rstrip()[-1] in '.!?':
             return False
 
-        # Contains impactful language
         impact_words = {'never', 'always', 'only', 'best', 'worst', 'must', 'need'}
         text_lower = segment.text.lower()
         if any(word in text_lower for word in impact_words):
@@ -1028,6 +1668,7 @@ Return ONLY the JSON array, no other text."""
                 from llama_cpp import Llama
 
                 model_path = self.hl_config.llm_model_path
+                model_name = self.hl_config.llm_model
 
                 # Check if the configured path exists
                 if model_path and Path(model_path).exists():
@@ -1036,8 +1677,8 @@ Return ONLY the JSON array, no other text."""
                     # Try to find model in models directory
                     models_dir = self.config.models_dir
                     possible_paths = [
+                        models_dir / model_name,
                         models_dir / f"{model_name}.gguf",
-                        models_dir / "Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf",
                         models_dir / "Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf",
                         Path.home() / ".cache" / "llama.cpp" / f"{model_name}.gguf",
                     ]

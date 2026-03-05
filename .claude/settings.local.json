@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \":*)",
+      "WebSearch",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/modules/highlight_detector.py''\\).read\\(\\)\\); print\\(''highlight_detector: OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/modules/caption_generator.py''\\).read\\(\\)\\); print\\(''caption_generator: OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/modules/video_clipper.py''\\).read\\(\\)\\); print\\(''video_clipper: OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/core/pipeline.py''\\).read\\(\\)\\); print\\(''pipeline: OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/ui/streamlit_app.py''\\).read\\(\\)\\); print\\(''streamlit_app: OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/modules/highlight_detector.py''\\).read\\(\\)\\); ast.parse\\(open\\(''src/modules/caption_generator.py''\\).read\\(\\)\\); ast.parse\\(open\\(''src/modules/video_clipper.py''\\).read\\(\\)\\); ast.parse\\(open\\(''src/core/pipeline.py''\\).read\\(\\)\\); ast.parse\\(open\\(''src/ui/streamlit_app.py''\\).read\\(\\)\\); print\\(''All files OK''\\)\")"
+    ]
+  }
+}
